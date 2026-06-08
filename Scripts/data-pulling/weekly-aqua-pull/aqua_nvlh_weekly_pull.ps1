@@ -1,0 +1,810 @@
+<#
+.SYNOPSIS
+Orchestrate weekly UPSVF AQUA pull, clean data, trigger ILAS analysis, and merge ILAS columns back into UPSVF.
+
+.DESCRIPTION
+Pulls UPSVF (unit parametric test/pass/fail) from AQUA, cleans column output, invokes ILAS analysis on VisualID+Lot keys,
+and merges ILAS-derived Vmin/Setter/MaxDTS_C/LP columns back into final output.
+
+CHANGES & AUTOMATED FIXES (2026-06-07):
+- Temp file collision fix (lines ~480-485): Replaced Move-Item -Force with Copy-Item -Force + explicit stale cleanup
+  Problem: Move-Item fails if destination exists (e.g., from prior failed run)
+  Solution: Copy-Item -Force atomically replaces content; pre-cleanup of stale .tmp removes collision risk
+  Impact: Re-runs and fault recovery now work correctly without manual cleanup
+- ILAS opergroup filtering: Delegated to aqua_nvlh_ilas_vmin_analysis.ps1 with default OpergroupFilter="6248_CLASSHOT"
+- ILAS test name cleaning: Added suffix filter (aqua_nvlh_ilas_vmin_analysis.ps1) to remove rows ending in "_it" or "_scrb"
+- Retention policy: 7-day test-end lookback maintained (LastNDaysTestEnd=7 as default)
+
+.PARAMETER LastNDaysTestEnd
+Default: 7 (filters AQUA pull to last 7 days of test end date)
+#>
+
+param(
+    [string]$AquaExe = "\\ger.corp.intel.com\ec\proj\ha\stav\DIS_Downloads\AquaHbase\AquaCMDClient\Client\AquaCmdLine.exe",
+    [string]$AquaServer = "GER",
+    [string]$ReportPath = "hmarkovi\BSAT_UPS2_POR_PTL_NVL WW12",
+    [string]$ProgramPattern = "NVLHM66*",
+    [string]$Operations = "6248",
+    [string]$OutputDirectory = "\\ger\ec\proj\ha\mmgbd\MMGBD_PSA\Products\NVL\NVL-H\Weekly Runs",
+    [string]$FunctionalBin = "100",
+    [int]$LastNDaysTestEnd = 7,
+    [int]$RetentionDays = 366,
+    [int]$MaxVisualUnits = 100000,
+    [int]$AquaMaxRows = 150000,
+    [int]$AquaPullTimeoutSeconds = 900,
+    [int]$AquaPullPollSeconds = 10,
+    [string]$IlasScriptPath = "",
+    [switch]$SkipIlasStep,
+    [switch]$KeepCleanCsvArtifact,
+    [string]$RawInputFile = "",
+    [string]$LotsOverride = ""
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+
+function Get-FirstExistingColumnName {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$CandidateNames,
+        [Parameter(Mandatory = $true)]
+        [string[]]$AvailableNames
+    )
+
+    foreach ($candidate in $CandidateNames) {
+        if ($AvailableNames -contains $candidate) {
+            return $candidate
+        }
+    }
+
+    return $null
+}
+
+function Get-SafeFileNamePart {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Value
+    )
+
+    $invalidChars = [System.IO.Path]::GetInvalidFileNameChars()
+    $safe = $Value
+    foreach ($char in $invalidChars) {
+        $safe = $safe.Replace($char, "_")
+    }
+
+    # Keep file names readable and reasonably short.
+    return ($safe -replace "\s+", "_").Trim("_")
+}
+
+function Get-IsoWeekYear {
+    param(
+        [Parameter(Mandatory = $true)]
+        [datetime]$Date
+    )
+
+    # Prefer the built-in ISO API when available (.NET Core / newer runtimes).
+    $isoWeekType = [type]::GetType("System.Globalization.ISOWeek")
+    if ($isoWeekType) {
+        return [pscustomobject]@{
+            Week = [System.Globalization.ISOWeek]::GetWeekOfYear($Date)
+            Year = [System.Globalization.ISOWeek]::GetYear($Date)
+        }
+    }
+
+    # PowerShell 5.1/.NET Framework fallback: ISO-like week/year using FirstFourDayWeek + Monday.
+    $cal = [System.Globalization.CultureInfo]::InvariantCulture.Calendar
+    $dateForWeek = $Date
+    if ($Date.DayOfWeek -eq [System.DayOfWeek]::Monday -or
+        $Date.DayOfWeek -eq [System.DayOfWeek]::Tuesday -or
+        $Date.DayOfWeek -eq [System.DayOfWeek]::Wednesday) {
+        $dateForWeek = $Date.AddDays(3)
+    }
+
+    return [pscustomobject]@{
+        Week = $cal.GetWeekOfYear($dateForWeek, [System.Globalization.CalendarWeekRule]::FirstFourDayWeek, [System.DayOfWeek]::Monday)
+        Year = $dateForWeek.Year
+    }
+}
+
+function Limit-RowsByVisualUnits {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object[]]$InputRows,
+        [Parameter(Mandatory = $true)]
+        [string]$VisualIdColumn,
+        [Parameter(Mandatory = $true)]
+        [int]$Limit
+    )
+
+    $seenVisualIds = New-Object 'System.Collections.Generic.HashSet[string]'
+    $selectedRows = New-Object System.Collections.Generic.List[object]
+
+    foreach ($row in $InputRows) {
+        $visualId = [string]$row.$VisualIdColumn
+        if ([string]::IsNullOrWhiteSpace($visualId)) {
+            continue
+        }
+
+        if ($seenVisualIds.Contains($visualId)) {
+            $selectedRows.Add($row)
+            continue
+        }
+
+        if ($seenVisualIds.Count -ge $Limit) {
+            continue
+        }
+
+        [void]$seenVisualIds.Add($visualId)
+        $selectedRows.Add($row)
+    }
+
+    return [pscustomobject]@{
+        Rows = $selectedRows
+        VisualUnitCount = $seenVisualIds.Count
+    }
+}
+
+function Remove-ExpiredRunFiles {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Directory,
+        [Parameter(Mandatory = $true)]
+        [datetime]$Cutoff
+    )
+
+    $patterns = @("_raw_*.csv", "_clean_*.csv", "_clean_*.jmp", "Vmin_*.csv", "Vmin_*.jmp")
+    foreach ($pattern in $patterns) {
+        Get-ChildItem -LiteralPath $Directory -Filter $pattern -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.LastWriteTime -lt $Cutoff } |
+            Remove-Item -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Update-LogRetention {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$LogPath,
+        [Parameter(Mandatory = $true)]
+        [datetime]$Cutoff
+    )
+
+    if (-not (Test-Path -LiteralPath $LogPath)) {
+        return
+    }
+
+    $lines = @(Get-Content -LiteralPath $LogPath)
+    if ($lines.Count -eq 0) {
+        return
+    }
+
+    $keptLines = New-Object System.Collections.Generic.List[string]
+    $keptLines.Add($lines[0])
+
+    $currentSection = New-Object System.Collections.Generic.List[string]
+    for ($index = 1; $index -lt $lines.Count; $index++) {
+        $line = $lines[$index]
+        if ($line -like '## WW*') {
+            if ($currentSection.Count -gt 0) {
+                $timestampLine = $currentSection | Where-Object { $_ -like '- Run timestamp:*' } | Select-Object -First 1
+                $keepSection = $true
+                if ($timestampLine) {
+                    $timestampValue = ($timestampLine -replace '^- Run timestamp:\s*', '').Trim()
+                    $parsedTimestamp = $null
+                    if ([datetime]::TryParse($timestampValue, [ref]$parsedTimestamp)) {
+                        $keepSection = $parsedTimestamp -ge $Cutoff
+                    }
+                }
+
+                if ($keepSection) {
+                    foreach ($sectionLine in $currentSection) {
+                        $keptLines.Add($sectionLine)
+                    }
+                }
+            }
+
+            $currentSection = New-Object System.Collections.Generic.List[string]
+        }
+
+        $currentSection.Add($line)
+    }
+
+    if ($currentSection.Count -gt 0) {
+        $timestampLine = $currentSection | Where-Object { $_ -like '- Run timestamp:*' } | Select-Object -First 1
+        $keepSection = $true
+        if ($timestampLine) {
+            $timestampValue = ($timestampLine -replace '^- Run timestamp:\s*', '').Trim()
+            $parsedTimestamp = $null
+            if ([datetime]::TryParse($timestampValue, [ref]$parsedTimestamp)) {
+                $keepSection = $parsedTimestamp -ge $Cutoff
+            }
+        }
+
+        if ($keepSection) {
+            foreach ($sectionLine in $currentSection) {
+                $keptLines.Add($sectionLine)
+            }
+        }
+    }
+
+    $keptLines | Set-Content -LiteralPath $LogPath -Encoding UTF8
+}
+
+function Assert-NonEmptyFile {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+        [Parameter(Mandatory = $true)]
+        [string]$Label
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        throw "$Label was not created: $Path"
+    }
+
+    $fileInfo = Get-Item -LiteralPath $Path
+    if ($fileInfo.Length -le 0) {
+        throw "$Label is empty: $Path"
+    }
+}
+
+function Wait-ForFileReady {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+        [Parameter(Mandatory = $true)]
+        [int]$TimeoutSeconds,
+        [Parameter(Mandatory = $true)]
+        [int]$PollSeconds,
+        [int]$StableChecks = 2
+    )
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $lastLength = -1
+    $stableCount = 0
+
+    while ((Get-Date) -lt $deadline) {
+        if (Test-Path -LiteralPath $Path) {
+            $currentLength = (Get-Item -LiteralPath $Path).Length
+            if ($currentLength -gt 0 -and $currentLength -eq $lastLength) {
+                $stableCount++
+                if ($stableCount -ge $StableChecks) {
+                    return $true
+                }
+            }
+            else {
+                $stableCount = 0
+                $lastLength = $currentLength
+            }
+        }
+
+        Start-Sleep -Seconds $PollSeconds
+    }
+
+    return $false
+}
+
+function Write-HealthLog {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$HealthLogPath,
+        [Parameter(Mandatory = $true)]
+        [datetime]$RunStart,
+        [Parameter(Mandatory = $true)]
+        [string]$Status,
+        [Parameter(Mandatory = $true)]
+        [string]$Message,
+        [int]$RowsBefore = 0,
+        [int]$RowsAfter = 0,
+        [int]$VisualUnits = 0,
+        [string]$CleanCsvPath = "",
+        [string]$JmpPath = ""
+    )
+
+    try {
+        $logDirectory = Split-Path -Path $HealthLogPath -Parent
+        if ($logDirectory -and -not (Test-Path -LiteralPath $logDirectory)) {
+            New-Item -Path $logDirectory -ItemType Directory -Force | Out-Null
+        }
+
+        $entry = [pscustomobject]@{
+            RunTimestamp = $RunStart.ToString("yyyy-MM-dd HH:mm:ss zzz")
+            Status = $Status
+            Message = $Message
+            RowsBefore = $RowsBefore
+            RowsAfter = $RowsAfter
+            VisualUnits = $VisualUnits
+            CleanCsvPath = $CleanCsvPath
+            JmpPath = $JmpPath
+        }
+
+        if (Test-Path -LiteralPath $HealthLogPath) {
+            $entry | Export-Csv -LiteralPath $HealthLogPath -Append -NoTypeInformation
+        }
+        else {
+            $entry | Export-Csv -LiteralPath $HealthLogPath -NoTypeInformation
+        }
+    }
+    catch {
+        Write-Warning "Could not write health log: $($_.Exception.Message)"
+    }
+}
+
+function Update-CsvLogRetention {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$CsvPath,
+        [Parameter(Mandatory = $true)]
+        [datetime]$Cutoff
+    )
+
+    if (-not (Test-Path -LiteralPath $CsvPath)) {
+        return
+    }
+
+    try {
+        $rows = @(Import-Csv -LiteralPath $CsvPath)
+        if ($rows.Count -eq 0) {
+            return
+        }
+
+        $kept = @($rows | Where-Object {
+            $ts = $null
+            [datetime]::TryParse([string]$_.RunTimestamp, [ref]$ts) -and $ts -ge $Cutoff
+        })
+
+        if ($kept.Count -gt 0) {
+            $kept | Export-Csv -LiteralPath $CsvPath -NoTypeInformation
+        }
+        else {
+            Remove-Item -LiteralPath $CsvPath -Force -ErrorAction SilentlyContinue
+        }
+    }
+    catch {
+        Write-Warning "Could not prune status CSV by retention: $($_.Exception.Message)"
+    }
+}
+
+function Test-UpsvfCsvReady {
+    param([string]$CsvPath)
+
+    if (-not (Test-Path -LiteralPath $CsvPath)) {
+        return $false
+    }
+
+    $rows = @(Import-Csv -LiteralPath $CsvPath)
+    if ($rows.Count -eq 0) {
+        return $false
+    }
+
+    $cols = $rows[0].PSObject.Properties.Name
+    $vidCol = Get-FirstExistingColumnName -CandidateNames @("Visual ID", "VISUAL_ID", "VisualId", "VISUALID", "VID", "VisualID") -AvailableNames $cols
+    $lotCol = Get-FirstExistingColumnName -CandidateNames @("LOTFROMFS", "LotFromFs", "LOT", "Lot", "SortLot", "SORT_LOT", "LATO_LOT") -AvailableNames $cols
+
+    return (-not [string]::IsNullOrWhiteSpace($vidCol) -and -not [string]::IsNullOrWhiteSpace($lotCol))
+}
+
+function Get-IlasScriptPath {
+    param([string]$ConfiguredPath)
+
+    if (-not [string]::IsNullOrWhiteSpace($ConfiguredPath)) {
+        return $ConfiguredPath
+    }
+
+    $weeklyDir = Split-Path -Path $PSCommandPath -Parent
+    $scriptsDir = Split-Path (Split-Path $weeklyDir -Parent) -Parent
+    $candidatePaths = @(
+        (Join-Path $weeklyDir "aqua_nvlh_ilas_vmin_analysis.ps1"),
+        (Join-Path $scriptsDir "parametric-analysis\ilas\aqua_nvlh_ilas_vmin_analysis.ps1")
+    )
+
+    foreach ($candidatePath in $candidatePaths) {
+        if (Test-Path -LiteralPath $candidatePath) {
+            return $candidatePath
+        }
+    }
+
+    return $candidatePaths[-1]
+}
+
+function Get-VisualLotKey {
+    param([string]$VisualId, [string]$Lot)
+    return ("{0}||{1}" -f $VisualId.Trim(), $Lot.Trim())
+}
+
+function Test-HasUpsvfDataForFreq {
+    param(
+        [object]$Row,
+        [string]$FreqToken,
+        [string[]]$ExcludeColumns
+    )
+
+    $alt1 = $FreqToken
+    $alt2 = $FreqToken -replace '\.', '_'
+    $alt3 = $FreqToken -replace '\.', ''
+
+    foreach ($prop in $Row.PSObject.Properties) {
+        $name = [string]$prop.Name
+        if ($ExcludeColumns -contains $name) { continue }
+        if ($name -like "ILAS_*") { continue }
+
+        if ($name -match [regex]::Escape($alt1) -or $name -match [regex]::Escape($alt2) -or $name -match [regex]::Escape($alt3)) {
+            $val = [string]$prop.Value
+            if (-not [string]::IsNullOrWhiteSpace($val)) {
+                return $true
+            }
+        }
+    }
+
+    return $false
+}
+
+function Merge-IlasColumnsIntoUpsvfCsv {
+    param(
+        [string]$UpsvfCsvPath,
+        [string]$IlasSummaryCsvPath
+    )
+
+    $upsRows = @(Import-Csv -LiteralPath $UpsvfCsvPath)
+    $ilasRows = @(Import-Csv -LiteralPath $IlasSummaryCsvPath)
+    if ($upsRows.Count -eq 0) { throw "UPSVF CSV is empty: $UpsvfCsvPath" }
+    if ($ilasRows.Count -eq 0) { throw "ILAS summary CSV is empty: $IlasSummaryCsvPath" }
+
+    $upsCols = $upsRows[0].PSObject.Properties.Name
+    $ilasCols = $ilasRows[0].PSObject.Properties.Name
+
+    $upsVidCol = Get-FirstExistingColumnName -CandidateNames @("Visual ID", "VISUAL_ID", "VisualId", "VISUALID", "VID", "VisualID") -AvailableNames $upsCols
+    $upsLotCol = Get-FirstExistingColumnName -CandidateNames @("LOTFROMFS", "LotFromFs", "LOT", "Lot", "SortLot", "SORT_LOT", "LATO_LOT") -AvailableNames $upsCols
+    $ilasVidCol = Get-FirstExistingColumnName -CandidateNames @("Visual ID", "VISUAL_ID", "VisualId", "VISUALID", "VID", "VisualID") -AvailableNames $ilasCols
+    $ilasLotCol = Get-FirstExistingColumnName -CandidateNames @("LotFromFs", "LOTFROMFS", "LOT", "Lot", "SortLot", "SORT_LOT", "LATO_LOT") -AvailableNames $ilasCols
+
+    if (-not $upsVidCol -or -not $upsLotCol) {
+        throw "UPSVF CSV must contain Visual ID and lot/class-lot columns."
+    }
+    if (-not $ilasVidCol -or -not $ilasLotCol) {
+        throw "ILAS summary must contain Visual ID and LotFromFs columns."
+    }
+
+    $ilasDataColumns = @($ilasCols | Where-Object { $_ -ne $ilasVidCol -and $_ -ne $ilasLotCol })
+    $ilasLookup = @{}
+    foreach ($r in $ilasRows) {
+        $vid = [string]$r.$ilasVidCol
+        $lot = [string]$r.$ilasLotCol
+        if ([string]::IsNullOrWhiteSpace($vid) -or [string]::IsNullOrWhiteSpace($lot)) { continue }
+        $key = Get-VisualLotKey -VisualId $vid -Lot $lot
+        $ilasLookup[$key] = $r
+    }
+
+    $ilasPrefixedColumns = @($ilasDataColumns | ForEach-Object { "ILAS_{0}" -f $_ })
+
+    foreach ($row in $upsRows) {
+        foreach ($col in $ilasPrefixedColumns) {
+            $row | Add-Member -NotePropertyName $col -NotePropertyValue "" -Force
+        }
+
+        $vid = [string]$row.$upsVidCol
+        $lot = [string]$row.$upsLotCol
+        if ([string]::IsNullOrWhiteSpace($vid) -or [string]::IsNullOrWhiteSpace($lot)) { continue }
+
+        $key = Get-VisualLotKey -VisualId $vid -Lot $lot
+        if (-not $ilasLookup.ContainsKey($key)) { continue }
+
+        $ilasRow = $ilasLookup[$key]
+        foreach ($srcCol in $ilasDataColumns) {
+            $dstCol = "ILAS_{0}" -f $srcCol
+            $row.$dstCol = $ilasRow.$srcCol
+        }
+    }
+
+    # Final cleanup: if UPSVF has no value for a frequency, clear all ILAS columns for that frequency.
+    foreach ($row in $upsRows) {
+        $freqToIlasCols = @{}
+        foreach ($prop in $row.PSObject.Properties) {
+            $col = [string]$prop.Name
+            if ($col -notlike "ILAS_*") { continue }
+            if ($col -match '_Freq(?<Freq>[0-9]+(?:\.[0-9]+)?)_C\d+_(Vmin|Setter|MaxDTS_C|LP)$') {
+                $f = [string]$Matches['Freq']
+                if (-not $freqToIlasCols.ContainsKey($f)) {
+                    $freqToIlasCols[$f] = New-Object System.Collections.Generic.List[string]
+                }
+                $freqToIlasCols[$f].Add($col)
+            }
+        }
+
+        foreach ($freq in $freqToIlasCols.Keys) {
+            if (-not (Test-HasUpsvfDataForFreq -Row $row -FreqToken $freq -ExcludeColumns $ilasPrefixedColumns)) {
+                foreach ($ilasCol in $freqToIlasCols[$freq]) {
+                    $row.$ilasCol = ""
+                }
+            }
+        }
+    }
+
+    $tmpPath = "{0}.tmp" -f $UpsvfCsvPath
+    if (Test-Path -LiteralPath $tmpPath) {
+        Remove-Item -LiteralPath $tmpPath -Force -ErrorAction SilentlyContinue
+    }
+
+    $upsRows | Export-Csv -LiteralPath $tmpPath -NoTypeInformation
+    Assert-NonEmptyFile -Path $tmpPath -Label "Merged UPSVF+ILAS CSV"
+
+    # Replace destination content in a way that tolerates pre-existing files.
+    Copy-Item -LiteralPath $tmpPath -Destination $UpsvfCsvPath -Force
+    Remove-Item -LiteralPath $tmpPath -Force -ErrorAction SilentlyContinue
+}
+
+$runStart = Get-Date
+$runStatus = "FAILED"
+$runMessage = "Unknown failure"
+$rowsBeforeCount = 0
+$rowsAfterCount = 0
+$visualUnitCount = 0
+$cleanCsvPath = ""
+$jmpPath = ""
+$csvPath = ""
+$ilasStatus = "NOT_RUN"
+$ilasMessage = "ILAS step not started"
+$ilasSummaryPath = ""
+
+
+try {
+    if (-not (Test-Path -LiteralPath $AquaExe)) {
+        throw "Aqua executable not found: $AquaExe"
+    }
+
+    if (-not (Test-Path -LiteralPath $OutputDirectory)) {
+        New-Item -Path $OutputDirectory -ItemType Directory -Force | Out-Null
+    }
+
+    $runStamp = Get-Date -Format "yyyyMMdd_HHmmss"
+    $retentionCutoff = (Get-Date).AddDays(-$RetentionDays)
+    $tempRawFile = Join-Path $OutputDirectory ("_raw_{0}.csv" -f $runStamp)
+    $tempCleanFile = Join-Path $OutputDirectory ("_clean_{0}.csv" -f $runStamp)
+    $sourceRawFile = ""
+    $pulledRawInThisRun = $false
+    $lotArgs = if ([string]::IsNullOrWhiteSpace($LotsOverride)) {
+        @("-lotsfromfs")
+    }
+    else {
+        @("-lots", $LotsOverride)
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($RawInputFile)) {
+        if (-not (Test-Path -LiteralPath $RawInputFile)) {
+            throw "Provided RawInputFile does not exist: $RawInputFile"
+        }
+
+        Write-Host "Using existing raw AQUA file: $RawInputFile"
+        $sourceRawFile = $RawInputFile
+    }
+    else {
+        Write-Host "Running AQUA pull..."
+        & $AquaExe `
+            -aquaserver $AquaServer `
+            -reportpath $ReportPath `
+            -outputfilename $tempRawFile `
+            -programNames $ProgramPattern `
+            -lastNDaysTestEnd $LastNDaysTestEnd `
+            -operations $Operations `
+            -dataSampling $AquaMaxRows `
+            $lotArgs `
+            -UnitFunctionalBin $FunctionalBin
+
+        Write-Host "Waiting for AQUA output file to be created and stabilized..."
+        $isReady = Wait-ForFileReady -Path $tempRawFile -TimeoutSeconds $AquaPullTimeoutSeconds -PollSeconds $AquaPullPollSeconds
+        if (-not $isReady) {
+            throw "AQUA output was not ready within $AquaPullTimeoutSeconds seconds: $tempRawFile"
+        }
+
+        $sourceRawFile = $tempRawFile
+        $pulledRawInThisRun = $true
+    }
+
+    $rows = Import-Csv -LiteralPath $sourceRawFile
+    if (-not $rows -or $rows.Count -eq 0) {
+        throw "Raw AQUA output is empty: $sourceRawFile"
+    }
+    $rowsBeforeCount = $rows.Count
+
+    # Drop DS columns right after raw pull.
+    $rawColumns = $rows[0].PSObject.Properties.Name
+    $keepRawColumns = $rawColumns | Where-Object { $_ -notlike "DS-IN-NA-GSDS_D_S::UPSVFPASSFLOW*" }
+    $droppedRawDsColumns = $rawColumns.Count - $keepRawColumns.Count
+    if ($droppedRawDsColumns -gt 0) {
+        Write-Host "Dropping $droppedRawDsColumns DS-IN-NA-GSDS_D_S::UPSVFPASSFLOW* column(s) immediately after pull..."
+        $rows = $rows | Select-Object -Property $keepRawColumns
+    }
+
+    $columns = $rows[0].PSObject.Properties.Name
+    $lotColumn = Get-FirstExistingColumnName -CandidateNames @("Lot", "LOT", "SortLot", "SORT_LOT", "LATO_LOT", "LOTFROMFS") -AvailableNames $columns
+    $stepColumn = Get-FirstExistingColumnName -CandidateNames @("RCS_PROCESSSTEP", "Rcs_ProcessStep", "PROCESSSTEP", "ProcessStep") -AvailableNames $columns
+    $programColumn = Get-FirstExistingColumnName -CandidateNames @("Program Name", "Program Name_RCS", "PROGRAM_NAME", "PROGRAM", "Program", "ProgramName") -AvailableNames $columns
+    $visualIdColumn = Get-FirstExistingColumnName -CandidateNames @("Visual ID", "VISUAL_ID", "VisualId", "VISUALID", "VID") -AvailableNames $columns
+
+    if (-not $lotColumn) {
+        throw "Could not find a lot column in the AQUA output."
+    }
+    if (-not $stepColumn) {
+        throw "Could not find RCS_PROCESSSTEP column in the AQUA output."
+    }
+    if (-not $programColumn) {
+        Write-Warning "Could not find a program-name column in the AQUA output. Falling back to UNKNOWN_PROGRAM for output naming."
+    }
+    if (-not $visualIdColumn) {
+        throw "Could not find a visual-unit column in the AQUA output."
+    }
+
+    $filteredRows = $rows | Where-Object {
+        $_.$lotColumn -notlike "*MV" -and $_.$stepColumn -eq "Classhot"
+    }
+
+    if (-not $filteredRows -or $filteredRows.Count -eq 0) {
+        throw "No rows left after filters (exclude *MV and keep Classhot)."
+    }
+
+    $limitedResult = Limit-RowsByVisualUnits -InputRows $filteredRows -VisualIdColumn $visualIdColumn -Limit $MaxVisualUnits
+    $filteredRows = $limitedResult.Rows
+    $visualUnitCount = $limitedResult.VisualUnitCount
+
+    if (-not $filteredRows -or $filteredRows.Count -eq 0) {
+        throw "No rows left after applying the visual-unit cap."
+    }
+    $rowsAfterCount = $filteredRows.Count
+
+    $topProgram = $null
+    if ($programColumn) {
+        $topProgram = $filteredRows |
+            Group-Object -Property $programColumn |
+            Sort-Object -Property Count -Descending |
+            Select-Object -First 1
+    }
+
+    $mostAbundantProgram = if ($topProgram -and $topProgram.Name) { $topProgram.Name } else { "UNKNOWN_PROGRAM" }
+    $safeProgram = Get-SafeFileNamePart -Value $mostAbundantProgram
+
+    $now = Get-Date
+    $isoInfo = Get-IsoWeekYear -Date $now
+    $isoWeek = $isoInfo.Week
+    $year = $isoInfo.Year
+    $csvName = "Vmin_{0}_WW{1:D2}_{2}.csv" -f $safeProgram, $isoWeek, $year
+    $csvPath = Join-Path $OutputDirectory $csvName
+
+    $filteredRows | Export-Csv -LiteralPath $tempCleanFile -NoTypeInformation
+
+    if ($KeepCleanCsvArtifact) {
+        $cleanCsvName = "Vmin_{0}_WW{1:D2}_{2}_clean.csv" -f $safeProgram, $isoWeek, $year
+        $cleanCsvPath = Join-Path $OutputDirectory $cleanCsvName
+        Copy-Item -LiteralPath $tempCleanFile -Destination $cleanCsvPath -Force
+    }
+
+    Write-Host "Finalizing CSV output..."
+    $filteredRows | Export-Csv -LiteralPath $csvPath -NoTypeInformation
+
+    if ($KeepCleanCsvArtifact) {
+        Assert-NonEmptyFile -Path $cleanCsvPath -Label "Clean CSV"
+    }
+    Assert-NonEmptyFile -Path $csvPath -Label "Final CSV output"
+
+    if (-not $SkipIlasStep) {
+        if (Test-UpsvfCsvReady -CsvPath $csvPath) {
+            try {
+                $resolvedIlasScriptPath = Get-IlasScriptPath -ConfiguredPath $IlasScriptPath
+                if (-not (Test-Path -LiteralPath $resolvedIlasScriptPath)) {
+                    throw "ILAS script not found: $resolvedIlasScriptPath"
+                }
+
+                $ilasOutDir = Join-Path $OutputDirectory ("_ilas_weekly_{0}" -f $runStamp)
+                if (-not (Test-Path -LiteralPath $ilasOutDir)) {
+                    New-Item -Path $ilasOutDir -ItemType Directory -Force | Out-Null
+                }
+
+                Write-Host "Running ILAS analysis for final UPSVF VisualID+lot pairs..."
+                & $resolvedIlasScriptPath `
+                    -AquaExe $AquaExe `
+                    -AquaServer $AquaServer `
+                    -ProgramPattern $ProgramPattern `
+                    -Operations $Operations `
+                    -FunctionalBin $FunctionalBin `
+                    -LastNDaysTestEnd $LastNDaysTestEnd `
+                    -OutputDirectory $ilasOutDir `
+                    -UpsvfReferenceCsv $csvPath
+
+                $ilasSummaryPath = Get-ChildItem -LiteralPath $ilasOutDir -Filter "ILAS_Vmin_Summary_*.csv" -File |
+                    Sort-Object LastWriteTime -Descending |
+                    Select-Object -First 1 -ExpandProperty FullName
+                if (-not $ilasSummaryPath) {
+                    throw "ILAS summary output was not generated in $ilasOutDir"
+                }
+
+                Merge-IlasColumnsIntoUpsvfCsv -UpsvfCsvPath $csvPath -IlasSummaryCsvPath $ilasSummaryPath
+                Assert-NonEmptyFile -Path $csvPath -Label "Final merged UPSVF+ILAS CSV"
+
+                $ilasStatus = "SUCCESS"
+                $ilasMessage = "ILAS completed and merged successfully"
+                Write-Host "ILAS merge completed successfully."
+            }
+            catch {
+                $ilasStatus = "FAILED"
+                $ilasMessage = $_.Exception.Message
+                Write-Warning "ILAS step failed. Keeping existing UPSVF weekly CSV unchanged. Details: $($ilasMessage)"
+            }
+        }
+        else {
+            $ilasStatus = "SKIPPED"
+            $ilasMessage = "UPSVF output missing required VisualID/lot structure; ILAS step was not started"
+            Write-Warning $ilasMessage
+        }
+    }
+    else {
+        $ilasStatus = "SKIPPED"
+        $ilasMessage = "ILAS step skipped by parameter"
+    }
+
+    # Remove transient working files after final outputs are confirmed.
+    if ($pulledRawInThisRun) {
+        Remove-Item -LiteralPath $tempRawFile -Force -ErrorAction SilentlyContinue
+    }
+    Remove-Item -LiteralPath $tempCleanFile -Force -ErrorAction SilentlyContinue
+
+    $statusCsvPath = Join-Path $OutputDirectory "Weekly_Run_Status.csv"
+
+    Remove-ExpiredRunFiles -Directory $OutputDirectory -Cutoff $retentionCutoff
+    Update-CsvLogRetention -CsvPath $statusCsvPath -Cutoff $retentionCutoff
+
+    $statusEntry = [pscustomobject]@{
+        RunTimestamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss zzz")
+        IsoWeek = ("WW{0:D2}-{1}" -f $isoWeek, $year)
+        ProgramFilter = $ProgramPattern
+        MostAbundantProgram = $mostAbundantProgram
+        RowsBeforeClean = $rows.Count
+        RowsAfterClean = $filteredRows.Count
+        AquaSamplingCapRows = $AquaMaxRows
+        VisualUnitsKept = $visualUnitCount
+        VisualUnitsCap = $MaxVisualUnits
+        CleanCsvPath = $cleanCsvPath
+        FinalOutputCsvPath = $csvPath
+        Filters = ("exclude lot suffix MV; keep RCS_PROCESSSTEP=Classhot; limit to {0} visual units" -f $MaxVisualUnits)
+        RetentionDays = $RetentionDays
+        IlasStatus = $ilasStatus
+        IlasMessage = $ilasMessage
+        IlasSummaryPath = $ilasSummaryPath
+    }
+
+    if (Test-Path -LiteralPath $statusCsvPath) {
+        $statusEntry | Export-Csv -LiteralPath $statusCsvPath -Append -NoTypeInformation
+    }
+    else {
+        $statusEntry | Export-Csv -LiteralPath $statusCsvPath -NoTypeInformation
+    }
+
+    if ($KeepCleanCsvArtifact -and -not [string]::IsNullOrWhiteSpace($cleanCsvPath)) {
+        Write-Host "Clean CSV: $cleanCsvPath"
+    }
+    Write-Host "Final CSV: $csvPath"
+    Write-Host "Status CSV: $statusCsvPath"
+    Write-Host "Rows before: $($rows.Count)"
+    Write-Host "Rows after:  $($filteredRows.Count)"
+    Write-Host "AQUA sampling cap: $AquaMaxRows"
+    Write-Host "Visual units kept: $visualUnitCount"
+    Write-Host "Top program: $mostAbundantProgram"
+
+    $runStatus = "SUCCESS"
+    $runMessage = "Run completed successfully"
+}
+catch {
+    $runStatus = "FAILED"
+    $runMessage = $_.Exception.Message
+    throw
+}
+finally {
+    $healthLogPath = Join-Path $OutputDirectory "Weekly_Run_Health.csv"
+    Write-HealthLog `
+        -HealthLogPath $healthLogPath `
+        -RunStart $runStart `
+        -Status $runStatus `
+        -Message $runMessage `
+        -RowsBefore $rowsBeforeCount `
+        -RowsAfter $rowsAfterCount `
+        -VisualUnits $visualUnitCount `
+        -CleanCsvPath $cleanCsvPath `
+        -JmpPath $csvPath
+}
