@@ -1,0 +1,3 @@
+# Local validation outputs generated during weekly verification runs
+# Keep these artifacts out of source control to preserve clean sync with origin.
+development/validation/
