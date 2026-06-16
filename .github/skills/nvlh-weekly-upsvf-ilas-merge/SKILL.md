@@ -14,7 +14,6 @@ This skill covers weekly orchestration and merge behavior only.
 It includes:
 - Running weekly UPSVF pull/clean/export
 - Starting ILAS only after UPSVF output is valid (VisualID + lot/class-lot present)
-- Passing UPSVF CSV as reference to ILAS so ILAS is filtered by VisualID+lot
 - Merging ILAS columns into final UPSVF CSV directly (no separate merge table required)
 - Prefixing merged columns with ILAS_
 - Preserving UPSVF output if ILAS step fails
@@ -39,9 +38,9 @@ It includes:
 
 PowerShell:
 
-& "C:\Projects\NVL\.docs\Scripts\aqua_nvlh_weekly_pull.ps1" \
-  -OutputDirectory "C:\Projects\NVL\.docs\Scripts\_verify_weekly_YYYYMMDD_HHMMSS" \
-  -LastNDaysTestEnd 7 \
+& ".\Scripts\data-pulling\weekly-aqua-pull\aqua_nvlh_weekly_pull.ps1" `
+  -OutputDirectory "R:\Products\NVL\NVL-H\Weekly Runs" `
+  -LastNDaysTestEnd 7 `
   -ProgramPattern "NVLHM66*"
 
 ## Outputs

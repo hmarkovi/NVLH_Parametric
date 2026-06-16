@@ -17,7 +17,6 @@ It includes:
 - Preservation of VMINFWCFG semantics in output columns: domain, frequency corner, flow, frequency, core
 - Separate handling of FMIN test instances (test-name-derived frequency, separate FMIN columns)
 - Exclusion of FMIN test instances from main F-corner aggregation
-- Optional filtering using UPSVF reference file by VisualID+lot keys
 
 This skill does not include UPSVF merge orchestration.
 
@@ -27,7 +26,6 @@ Typical inputs:
 - AQUA connectivity: AquaExe, AquaServer, IlasReportPath, ProgramPattern, Operations
 - Time window: LastNDaysTestEnd
 - Optional local raw file: RawInputFile
-- Optional UPSVF reference file: UpsvfReferenceCsv
 - OutputDirectory
 
 ## Output Artifacts
@@ -53,14 +51,7 @@ Summary rows are keyed by VisualID and LotFromFs.
 
 PowerShell:
 
-& "C:\Projects\NVL\.docs\Scripts\aqua_nvlh_ilas_vmin_analysis.ps1" \
-  -LastNDaysTestEnd 7 \
-  -ProgramPattern "NVLHM66*" \
-  -OutputDirectory "C:\Projects\NVL\.docs\Scripts\_tmp_ilas_run"
-
-With UPSVF reference filtering:
-
-& "C:\Projects\NVL\.docs\Scripts\aqua_nvlh_ilas_vmin_analysis.ps1" \
-  -RawInputFile "C:\Projects\NVL\.docs\Scripts\_ilas_probe_20260602_153216.csv" \
-  -UpsvfReferenceCsv "\\ger\ec\proj\ha\mmgbd\MMGBD_PSA\Products\NVL\NVL-H\Weekly Runs\Vmin_NVLHM66A0H30M00S622_WW23_2026.csv" \
-  -OutputDirectory "C:\Projects\NVL\.docs\Scripts\_tmp_ilas_verify"
+& ".\Scripts\parametric-analysis\ilas\aqua_nvlh_ilas_vmin_analysis.ps1" `
+  -IlasReportPath "hmarkovi\ILAS_VMIN_DTS" `
+  -ProgramPattern "NVLHM66*" `
+  -OutputDirectory "R:\Products\NVL\NVL-H\Weekly Runs"
