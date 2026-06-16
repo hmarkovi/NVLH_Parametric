@@ -1,3 +1,14 @@
-# Local validation outputs generated during weekly verification runs
-# Keep these artifacts out of source control to preserve clean sync with origin.
+# Local validation outputs generated during weekly verification runs.
+# Keep runtime/heavy artifacts out of source control.
 development/validation/
+
+# Additional runtime artifacts under development validation runs.
+development/**/_automation_logs/
+development/**/_ilas_weekly_*/
+development/**/*_raw_*.csv
+development/**/*.csv.gz
+
+# Typical local temp/log artifacts.
+*.tmp
+*.temp
+*.log
