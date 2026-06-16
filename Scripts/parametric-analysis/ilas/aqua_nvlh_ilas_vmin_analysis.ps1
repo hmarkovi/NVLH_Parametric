@@ -21,7 +21,7 @@ Default: "6248_CLASSHOT" (ensures only Classhot opergroup data retained)
 param(
     [string]$AquaExe = "\\ger.corp.intel.com\ec\proj\ha\stav\DIS_Downloads\AquaHbase\AquaCMDClient\Client\AquaCmdLine.exe",
     [string]$AquaServer = "GER",
-    [string]$IlasReportPath = "sbelyy\ILAS\ILAS_VMIN_DTS",
+    [string]$IlasReportPath = "hmarkovi\ILAS_VMIN_DTS",
     [string]$OpergroupFilter = "6248_CLASSHOT",
     [string]$ProgramPattern = "NVLHM66*",
     [string]$Operations = "6248",
@@ -427,12 +427,16 @@ function Filter-RowsByOpergroup {
         Where-Object { $cols -contains $_ } | Select-Object -First 1
 
     if (-not $opergroupCol) {
-        Write-Warning "OPERGROUP column not found in ILAS raw data; skipping opergroup filter."
-        return $Rows
+        throw "OPERGROUP column not found in ILAS raw data; cannot enforce OPERGROUP=$OpergroupFilterValue cleanup."
     }
 
     $before = $Rows.Count
-    $filtered = @($Rows | Where-Object { [string]$_.$opergroupCol -eq $OpergroupFilterValue })
+    $targetOpergroup = $OpergroupFilterValue.Trim().ToUpperInvariant()
+    $filtered = @(
+        $Rows | Where-Object {
+            ([string]$_.$opergroupCol).Trim().ToUpperInvariant() -eq $targetOpergroup
+        }
+    )
     Write-Host ("Filtered ILAS rows by OPERGROUP={0}: {1} -> {2}" -f $OpergroupFilterValue, $before, $filtered.Count)
 
     if ($filtered.Count -eq 0) {
@@ -517,6 +521,8 @@ try {
         $lotArgs = @("-lots", $LotsOverride)
     }
 
+    $hasSpecificFilter = ($visualIdArg.Count -gt 0) -or ($lotArgs.Count -gt 1)
+
     if (-not [string]::IsNullOrWhiteSpace($RawInputFile)) {
         if (-not (Test-Path -LiteralPath $RawInputFile)) { throw "Provided RawInputFile does not exist: $RawInputFile" }
         Write-Host "Using existing ILAS raw file: $RawInputFile"
@@ -531,7 +537,6 @@ try {
             "-reportpath", $IlasReportPath,
             "-outputfilename", $tempRawFile,
             "-programNames", $ProgramPattern,
-            "-lastNDaysTestEnd", [string]$LastNDaysTestEnd,
             "-operations", $Operations,
             "-UnitFunctionalBin", $FunctionalBin
         )
@@ -542,6 +547,13 @@ try {
             $aquaArgs += $visualIdArg
         }
         $aquaArgs += $lotArgs
+        if ((-not $hasSpecificFilter) -and $LastNDaysTestEnd -gt 0) {
+            $aquaArgs += @("-lastNDaysTestEnd", [string]$LastNDaysTestEnd)
+            Write-Host ("ILAS AQUA query filter mode: LastNDaysTestEnd={0}" -f $LastNDaysTestEnd)
+        }
+        else {
+            Write-Host "ILAS AQUA query filter mode: specific lot/VisualID filter only."
+        }
 
         & $AquaExe @aquaArgs
 

@@ -15,6 +15,13 @@ CHANGES & AUTOMATED FIXES (2026-06-07):
 - ILAS test name cleaning: Added suffix filter (aqua_nvlh_ilas_vmin_analysis.ps1) to remove rows ending in "_it" or "_scrb"
 - Retention policy: 7-day test-end lookback maintained (LastNDaysTestEnd=7 as default)
 
+CHANGES (2026-06-09):
+- Removed -LastNDaysTestEnd from ILAS script invocation (aqua_nvlh_ilas_vmin_analysis.ps1 no longer receives it)
+  Reason: ILAS query is VisualID-scoped and must not be date-bounded; passing LastNDays caused empty AQUA results
+- Fixed retention CSV pruning bug: changed [datetime]::TryParse to [datetimeoffset]::TryParse
+  Reason: status CSV timestamps include timezone offset (e.g., +02:00); DateTime.TryParse overload with [ref] arg
+  not available in PowerShell 5.1, causing "Cannot find an overload" warning on every run
+
 .PARAMETER LastNDaysTestEnd
 Default: 7 (filters AQUA pull to last 7 days of test end date)
 #>
@@ -283,6 +290,44 @@ function Wait-ForFileReady {
     return $false
 }
 
+function Resolve-AquaExePathForAutomation {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$SourceAquaExePath
+    )
+    
+    # Cache AquaCmdLine.exe locally and unblock it to eliminate UNC security zone warnings
+    # This allows fully unattended execution (e.g., at 5AM via Task Scheduler)
+    
+    $cacheDir = Join-Path $env:LOCALAPPDATA "NVLH\AquaCmdLine"
+    $cachedExe = Join-Path $cacheDir "AquaCmdLine.exe"
+    
+    # Ensure cache directory exists
+    if (-not (Test-Path -LiteralPath $cacheDir)) {
+        New-Item -Path $cacheDir -ItemType Directory -Force | Out-Null
+    }
+    
+    # Copy from UNC if not cached, or if source is newer
+    $needsCopy = $false
+    if (-not (Test-Path -LiteralPath $cachedExe)) {
+        $needsCopy = $true
+    } else {
+        $sourceInfo = Get-Item -LiteralPath $SourceAquaExePath
+        $cachedInfo = Get-Item -LiteralPath $cachedExe
+        if ($sourceInfo.LastWriteTime -gt $cachedInfo.LastWriteTime) {
+            $needsCopy = $true
+        }
+    }
+    
+    if ($needsCopy) {
+        Copy-Item -LiteralPath $SourceAquaExePath -Destination $cachedExe -Force | Out-Null
+        # Unblock the local copy to suppress security warnings
+        Unblock-File -LiteralPath $cachedExe -ErrorAction SilentlyContinue
+    }
+    
+    return $cachedExe
+}
+
 function Write-HealthLog {
     param(
         [Parameter(Mandatory = $true)]
@@ -348,8 +393,8 @@ function Update-CsvLogRetention {
         }
 
         $kept = @($rows | Where-Object {
-            $ts = $null
-            [datetime]::TryParse([string]$_.RunTimestamp, [ref]$ts) -and $ts -ge $Cutoff
+            $ts = [datetimeoffset]::MinValue
+            [datetimeoffset]::TryParse([string]$_.RunTimestamp, [ref]$ts) -and $ts.UtcDateTime -ge $Cutoff.ToUniversalTime()
         })
 
         if ($kept.Count -gt 0) {
@@ -411,13 +456,57 @@ function Get-VisualLotKey {
     return ("{0}||{1}" -f $VisualId.Trim(), $Lot.Trim())
 }
 
-function Test-HasUpsvfDataForFreq {
+function Get-DomainCandidates {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$DomainToken
+    )
+
+    $candidates = New-Object System.Collections.Generic.List[string]
+    if ([string]::IsNullOrWhiteSpace($DomainToken)) {
+        return @($candidates)
+    }
+
+    # Domain mappings from ILAS naming to UPSVF naming.
+    # Known issue domains: CR, CCF/CLR, AT, GT, GTVG, SAAT, SAQ, SAC.
+    $domainAliases = @{
+        "CR" = @("CR")
+        "CCF" = @("CCF", "CLR")
+        "CLR" = @("CCF", "CLR")
+        "AT" = @("AT")
+        "GT" = @("GT")
+        "GTVG" = @("GTVG")
+        "SAAT" = @("SAAT")
+        "SAQ" = @("SAQ")
+        "SAC" = @("SAC")
+    }
+
+    $token = $DomainToken.Trim().ToUpperInvariant()
+    $candidates.Add($token)
+
+    # Common ILAS domain naming includes trailing core index (for example SAQ0, CR0).
+    $withoutDigits = ($token -replace '\d+$', '')
+    if (-not [string]::IsNullOrWhiteSpace($withoutDigits)) {
+        $candidates.Add($withoutDigits)
+        if ($domainAliases.ContainsKey($withoutDigits)) {
+            foreach ($alias in $domainAliases[$withoutDigits]) {
+                $candidates.Add($alias)
+            }
+        }
+    }
+
+    return @($candidates | Select-Object -Unique)
+}
+
+function Test-HasUpsvfDataForDomainFreq {
     param(
         [object]$Row,
+        [string]$DomainToken,
         [string]$FreqToken,
         [string[]]$ExcludeColumns
     )
 
+    $domainCandidates = @(Get-DomainCandidates -DomainToken $DomainToken)
     $alt1 = $FreqToken
     $alt2 = $FreqToken -replace '\.', '_'
     $alt3 = $FreqToken -replace '\.', ''
@@ -426,6 +515,16 @@ function Test-HasUpsvfDataForFreq {
         $name = [string]$prop.Name
         if ($ExcludeColumns -contains $name) { continue }
         if ($name -like "ILAS_*") { continue }
+
+        $domainMatch = $false
+        foreach ($domainCandidate in $domainCandidates) {
+            if ([string]::IsNullOrWhiteSpace($domainCandidate)) { continue }
+            if ($name -match ("(?<![A-Za-z0-9]){0}(?![A-Za-z0-9])" -f [regex]::Escape($domainCandidate))) {
+                $domainMatch = $true
+                break
+            }
+        }
+        if (-not $domainMatch) { continue }
 
         if ($name -match [regex]::Escape($alt1) -or $name -match [regex]::Escape($alt2) -or $name -match [regex]::Escape($alt3)) {
             $val = [string]$prop.Value
@@ -495,24 +594,31 @@ function Merge-IlasColumnsIntoUpsvfCsv {
         }
     }
 
-    # Final cleanup: if UPSVF has no value for a frequency, clear all ILAS columns for that frequency.
+    # Final cleanup: if UPSVF has no value for a given ILAS domain+frequency, clear matching ILAS columns.
     foreach ($row in $upsRows) {
-        $freqToIlasCols = @{}
+        $domainFreqToIlasCols = @{}
         foreach ($prop in $row.PSObject.Properties) {
             $col = [string]$prop.Name
             if ($col -notlike "ILAS_*") { continue }
-            if ($col -match '_Freq(?<Freq>[0-9]+(?:\.[0-9]+)?)_C\d+_(Vmin|Setter|MaxDTS_C|LP)$') {
+            if ($col -match '^ILAS_(?<Domain>.+?)_F\d+_Flow\d+_Freq(?<Freq>[0-9]+(?:\.[0-9]+)?)_C\d+_(Vmin|Setter|MaxDTS_C|LP)$') {
+                $d = [string]$Matches['Domain']
                 $f = [string]$Matches['Freq']
-                if (-not $freqToIlasCols.ContainsKey($f)) {
-                    $freqToIlasCols[$f] = New-Object System.Collections.Generic.List[string]
+                $k = "{0}||{1}" -f $d, $f
+                if (-not $domainFreqToIlasCols.ContainsKey($k)) {
+                    $domainFreqToIlasCols[$k] = New-Object System.Collections.Generic.List[string]
                 }
-                $freqToIlasCols[$f].Add($col)
+                $domainFreqToIlasCols[$k].Add($col)
             }
         }
 
-        foreach ($freq in $freqToIlasCols.Keys) {
-            if (-not (Test-HasUpsvfDataForFreq -Row $row -FreqToken $freq -ExcludeColumns $ilasPrefixedColumns)) {
-                foreach ($ilasCol in $freqToIlasCols[$freq]) {
+        foreach ($domainFreq in $domainFreqToIlasCols.Keys) {
+            $parts = $domainFreq -split '\|\|', 2
+            if ($parts.Count -ne 2) { continue }
+
+            $domain = $parts[0]
+            $freq = $parts[1]
+            if (-not (Test-HasUpsvfDataForDomainFreq -Row $row -DomainToken $domain -FreqToken $freq -ExcludeColumns $ilasPrefixedColumns)) {
+                foreach ($ilasCol in $domainFreqToIlasCols[$domainFreq]) {
                     $row.$ilasCol = ""
                 }
             }
@@ -541,9 +647,35 @@ $visualUnitCount = 0
 $cleanCsvPath = ""
 $jmpPath = ""
 $csvPath = ""
+$tempMergedWorkFile = ""
 $ilasStatus = "NOT_RUN"
 $ilasMessage = "ILAS step not started"
 $ilasSummaryPath = ""
+
+function Test-IsIlasDataUnavailableMessage {
+    param([string]$Message)
+
+    if ([string]::IsNullOrWhiteSpace($Message)) {
+        return $false
+    }
+
+    $patterns = @(
+        "completed without creating an output file",
+        "ILAS summary output was not generated",
+        "AQUA ILAS output was not ready",
+        "ILAS raw file is empty",
+        "No ILAS rows remain",
+        "No detail records produced"
+    )
+
+    foreach ($pattern in $patterns) {
+        if ($Message.IndexOf($pattern, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+            return $true
+        }
+    }
+
+    return $false
+}
 
 
 try {
@@ -559,6 +691,7 @@ try {
     $retentionCutoff = (Get-Date).AddDays(-$RetentionDays)
     $tempRawFile = Join-Path $OutputDirectory ("_raw_{0}.csv" -f $runStamp)
     $tempCleanFile = Join-Path $OutputDirectory ("_clean_{0}.csv" -f $runStamp)
+    $tempMergedWorkFile = Join-Path $OutputDirectory ("_merged_work_{0}.csv" -f $runStamp)
     $sourceRawFile = ""
     $pulledRawInThisRun = $false
     $lotArgs = if ([string]::IsNullOrWhiteSpace($LotsOverride)) {
@@ -578,16 +711,36 @@ try {
     }
     else {
         Write-Host "Running AQUA pull..."
-        & $AquaExe `
-            -aquaserver $AquaServer `
-            -reportpath $ReportPath `
-            -outputfilename $tempRawFile `
-            -programNames $ProgramPattern `
-            -lastNDaysTestEnd $LastNDaysTestEnd `
-            -operations $Operations `
-            -dataSampling $AquaMaxRows `
-            $lotArgs `
-            -UnitFunctionalBin $FunctionalBin
+        # Resolve AquaCmdLine.exe to local cache (eliminates UNC security warnings for unattended execution)
+        $AquaExe = Resolve-AquaExePathForAutomation -SourceAquaExePath $AquaExe
+        Write-Host "Using Aqua executable: $AquaExe"
+
+        # Build AQUA args array conditionally so callers can clear individual filters
+        # by passing empty string (ProgramPattern/Operations) or 0 (LastNDaysTestEnd).
+        $aquaCallArgs = [System.Collections.Generic.List[string]]::new()
+        $aquaCallArgs.AddRange([string[]]@("-aquaserver", $AquaServer, "-reportpath", $ReportPath, "-outputfilename", $tempRawFile))
+        if (-not [string]::IsNullOrWhiteSpace($ProgramPattern)) {
+            $aquaCallArgs.AddRange([string[]]@("-programNames", $ProgramPattern))
+        }
+        if ($LastNDaysTestEnd -gt 0) {
+            $aquaCallArgs.AddRange([string[]]@("-lastNDaysTestEnd", [string]$LastNDaysTestEnd))
+        }
+        if (-not [string]::IsNullOrWhiteSpace($Operations)) {
+            $aquaCallArgs.AddRange([string[]]@("-operations", $Operations))
+        }
+        $aquaCallArgs.AddRange([string[]]@("-dataSampling", [string]$AquaMaxRows))
+        $aquaCallArgs.AddRange([string[]]$lotArgs)
+        $aquaCallArgs.AddRange([string[]]@("-UnitFunctionalBin", $FunctionalBin))
+
+        $activeFilters = @()
+        if (-not [string]::IsNullOrWhiteSpace($ProgramPattern)) { $activeFilters += "ProgramNames=$ProgramPattern" }
+        if ($LastNDaysTestEnd -gt 0)                             { $activeFilters += "LastNDaysTestEnd=$LastNDaysTestEnd" }
+        if (-not [string]::IsNullOrWhiteSpace($Operations))      { $activeFilters += "Operations=$Operations" }
+        $activeFilters += "LotArgs=$($lotArgs -join ' ')"
+        $activeFilters += "FunctionalBin=$FunctionalBin"
+        Write-Host "AQUA filters active: $($activeFilters -join ' | ')"
+
+        & $AquaExe @aquaCallArgs
 
         Write-Host "Waiting for AQUA output file to be created and stabilized..."
         $isReady = Wait-ForFileReady -Path $tempRawFile -TimeoutSeconds $AquaPullTimeoutSeconds -PollSeconds $AquaPullPollSeconds
@@ -669,6 +822,7 @@ try {
     $csvPath = Join-Path $OutputDirectory $csvName
 
     $filteredRows | Export-Csv -LiteralPath $tempCleanFile -NoTypeInformation
+    $filteredRows | Export-Csv -LiteralPath $tempMergedWorkFile -NoTypeInformation
 
     if ($KeepCleanCsvArtifact) {
         $cleanCsvName = "Vmin_{0}_WW{1:D2}_{2}_clean.csv" -f $safeProgram, $isoWeek, $year
@@ -676,20 +830,23 @@ try {
         Copy-Item -LiteralPath $tempCleanFile -Destination $cleanCsvPath -Force
     }
 
-    Write-Host "Finalizing CSV output..."
-    $filteredRows | Export-Csv -LiteralPath $csvPath -NoTypeInformation
-
     if ($KeepCleanCsvArtifact) {
         Assert-NonEmptyFile -Path $cleanCsvPath -Label "Clean CSV"
     }
-    Assert-NonEmptyFile -Path $csvPath -Label "Final CSV output"
 
     if (-not $SkipIlasStep) {
-        if (Test-UpsvfCsvReady -CsvPath $csvPath) {
+        if (Test-UpsvfCsvReady -CsvPath $tempMergedWorkFile) {
             try {
                 $resolvedIlasScriptPath = Get-IlasScriptPath -ConfiguredPath $IlasScriptPath
                 if (-not (Test-Path -LiteralPath $resolvedIlasScriptPath)) {
                     throw "ILAS script not found: $resolvedIlasScriptPath"
+                }
+
+                try {
+                    Unblock-File -LiteralPath $resolvedIlasScriptPath -ErrorAction SilentlyContinue
+                }
+                catch {
+                    Write-Warning "Could not unblock ILAS script (continuing): $($_.Exception.Message)"
                 }
 
                 $ilasOutDir = Join-Path $OutputDirectory ("_ilas_weekly_{0}" -f $runStamp)
@@ -697,16 +854,15 @@ try {
                     New-Item -Path $ilasOutDir -ItemType Directory -Force | Out-Null
                 }
 
-                Write-Host "Running ILAS analysis for final UPSVF VisualID+lot pairs..."
+                Write-Host "Running ILAS analysis for final UPSVF VisualID set..."
                 & $resolvedIlasScriptPath `
                     -AquaExe $AquaExe `
                     -AquaServer $AquaServer `
                     -ProgramPattern $ProgramPattern `
                     -Operations $Operations `
                     -FunctionalBin $FunctionalBin `
-                    -LastNDaysTestEnd $LastNDaysTestEnd `
                     -OutputDirectory $ilasOutDir `
-                    -UpsvfReferenceCsv $csvPath
+                    -UpsvfReferenceCsv $tempMergedWorkFile
 
                 $ilasSummaryPath = Get-ChildItem -LiteralPath $ilasOutDir -Filter "ILAS_Vmin_Summary_*.csv" -File |
                     Sort-Object LastWriteTime -Descending |
@@ -715,7 +871,9 @@ try {
                     throw "ILAS summary output was not generated in $ilasOutDir"
                 }
 
-                Merge-IlasColumnsIntoUpsvfCsv -UpsvfCsvPath $csvPath -IlasSummaryCsvPath $ilasSummaryPath
+                Merge-IlasColumnsIntoUpsvfCsv -UpsvfCsvPath $tempMergedWorkFile -IlasSummaryCsvPath $ilasSummaryPath
+                Assert-NonEmptyFile -Path $tempMergedWorkFile -Label "Final merged UPSVF+ILAS working CSV"
+                Copy-Item -LiteralPath $tempMergedWorkFile -Destination $csvPath -Force
                 Assert-NonEmptyFile -Path $csvPath -Label "Final merged UPSVF+ILAS CSV"
 
                 $ilasStatus = "SUCCESS"
@@ -723,9 +881,18 @@ try {
                 Write-Host "ILAS merge completed successfully."
             }
             catch {
-                $ilasStatus = "FAILED"
                 $ilasMessage = $_.Exception.Message
-                Write-Warning "ILAS step failed. Keeping existing UPSVF weekly CSV unchanged. Details: $($ilasMessage)"
+                if (Test-IsIlasDataUnavailableMessage -Message $ilasMessage) {
+                    $ilasStatus = "WAITING_FOR_DATA"
+                    $ilasMessage = "ILAS data is not yet available for this run. Saved UPSVF-only CSV and will merge ILAS when data appears. Details: $ilasMessage"
+                    Copy-Item -LiteralPath $tempMergedWorkFile -Destination $csvPath -Force
+                    Assert-NonEmptyFile -Path $csvPath -Label "UPSVF-only CSV while waiting for ILAS data"
+                    Write-Warning $ilasMessage
+                }
+                else {
+                    $ilasStatus = "FAILED"
+                    Write-Warning "ILAS step failed. Final UPSVF+ILAS CSV was not created. Details: $($ilasMessage)"
+                }
             }
         }
         else {
@@ -735,6 +902,9 @@ try {
         }
     }
     else {
+        Write-Host "Finalizing CSV output..."
+        Copy-Item -LiteralPath $tempMergedWorkFile -Destination $csvPath -Force
+        Assert-NonEmptyFile -Path $csvPath -Label "Final CSV output"
         $ilasStatus = "SKIPPED"
         $ilasMessage = "ILAS step skipped by parameter"
     }
@@ -744,6 +914,7 @@ try {
         Remove-Item -LiteralPath $tempRawFile -Force -ErrorAction SilentlyContinue
     }
     Remove-Item -LiteralPath $tempCleanFile -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $tempMergedWorkFile -Force -ErrorAction SilentlyContinue
 
     $statusCsvPath = Join-Path $OutputDirectory "Weekly_Run_Status.csv"
 
@@ -761,7 +932,7 @@ try {
         VisualUnitsKept = $visualUnitCount
         VisualUnitsCap = $MaxVisualUnits
         CleanCsvPath = $cleanCsvPath
-        FinalOutputCsvPath = $csvPath
+        FinalOutputCsvPath = $(if ($ilasStatus -eq "SUCCESS" -or $ilasStatus -eq "WAITING_FOR_DATA" -or $SkipIlasStep) { $csvPath } else { "" })
         Filters = ("exclude lot suffix MV; keep RCS_PROCESSSTEP=Classhot; limit to {0} visual units" -f $MaxVisualUnits)
         RetentionDays = $RetentionDays
         IlasStatus = $ilasStatus
@@ -779,7 +950,9 @@ try {
     if ($KeepCleanCsvArtifact -and -not [string]::IsNullOrWhiteSpace($cleanCsvPath)) {
         Write-Host "Clean CSV: $cleanCsvPath"
     }
-    Write-Host "Final CSV: $csvPath"
+    if ($ilasStatus -eq "SUCCESS" -or $ilasStatus -eq "WAITING_FOR_DATA" -or $SkipIlasStep) {
+        Write-Host "Final CSV: $csvPath"
+    }
     Write-Host "Status CSV: $statusCsvPath"
     Write-Host "Rows before: $($rows.Count)"
     Write-Host "Rows after:  $($filteredRows.Count)"
@@ -787,8 +960,19 @@ try {
     Write-Host "Visual units kept: $visualUnitCount"
     Write-Host "Top program: $mostAbundantProgram"
 
+    if (-not $SkipIlasStep -and $ilasStatus -eq "FAILED") {
+        $runStatus = "FAILED"
+        $runMessage = "Final UPSVF+ILAS CSV was not created. $ilasMessage"
+        throw $runMessage
+    }
+
     $runStatus = "SUCCESS"
-    $runMessage = "Run completed successfully"
+    if ($ilasStatus -eq "WAITING_FOR_DATA") {
+        $runMessage = "Run completed with UPSVF-only CSV; waiting for ILAS data availability"
+    }
+    else {
+        $runMessage = "Run completed successfully"
+    }
 }
 catch {
     $runStatus = "FAILED"
