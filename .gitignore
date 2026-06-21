@@ -12,3 +12,6 @@ development/**/*.csv.gz
 *.tmp
 *.temp
 *.log
+
+# Unrelated local working materials.
+course/
