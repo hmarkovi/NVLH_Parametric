@@ -22,6 +22,12 @@ CHANGES (2026-06-09):
   Reason: status CSV timestamps include timezone offset (e.g., +02:00); DateTime.TryParse overload with [ref] arg
   not available in PowerShell 5.1, causing "Cannot find an overload" warning on every run
 
+CHANGES (2026-06-21):
+- AQUA report format change: RCS_PROCESSSTEP column no longer present in BSAT_UPS2_POR_PTL_NVL WW12 report output
+  New format uses DevRevStep_CLASSHOT (non-empty value = unit ran at CLASSHOT; empty = did not)
+  Fix: step-column detection now falls back to DevRevStep_CLASSHOT when RCS_PROCESSSTEP variants are absent
+  Filter mode tracks which column was found: "EqClasshot" (old) vs "NotEmpty" (new DevRevStep_CLASSHOT)
+
 .PARAMETER LastNDaysTestEnd
 Default: 7 (filters AQUA pull to last 7 days of test end date)
 #>
@@ -769,7 +775,13 @@ try {
 
     $columns = $rows[0].PSObject.Properties.Name
     $lotColumn = Get-FirstExistingColumnName -CandidateNames @("Lot", "LOT", "SortLot", "SORT_LOT", "LATO_LOT", "LOTFROMFS") -AvailableNames $columns
+    # Try legacy RCS_PROCESSSTEP first (value = "Classhot"); fall back to new DevRevStep_CLASSHOT (non-empty = unit was at CLASSHOT).
     $stepColumn = Get-FirstExistingColumnName -CandidateNames @("RCS_PROCESSSTEP", "Rcs_ProcessStep", "PROCESSSTEP", "ProcessStep") -AvailableNames $columns
+    $stepFilterMode = "EqClasshot"
+    if (-not $stepColumn) {
+        $stepColumn = Get-FirstExistingColumnName -CandidateNames @("DevRevStep_CLASSHOT", "DEVREVSTEP_CLASSHOT") -AvailableNames $columns
+        $stepFilterMode = "NotEmpty"
+    }
     $programColumn = Get-FirstExistingColumnName -CandidateNames @("Program Name", "Program Name_RCS", "PROGRAM_NAME", "PROGRAM", "Program", "ProgramName") -AvailableNames $columns
     $visualIdColumn = Get-FirstExistingColumnName -CandidateNames @("Visual ID", "VISUAL_ID", "VisualId", "VISUALID", "VID") -AvailableNames $columns
 
@@ -777,7 +789,17 @@ try {
         throw "Could not find a lot column in the AQUA output."
     }
     if (-not $stepColumn) {
-        throw "Could not find RCS_PROCESSSTEP column in the AQUA output."
+        $stepLikeColumns = @($columns | Where-Object {
+            $_ -match '(?i)(step|devrev|process|classhot|opergroup|operation)'
+        })
+        $stepLikePreview = if ($stepLikeColumns.Count -gt 0) {
+            ($stepLikeColumns | Select-Object -First 25) -join '; '
+        }
+        else {
+            '<none>'
+        }
+
+        throw "Could not find a process-step column in the AQUA output. Tried RCS_PROCESSSTEP variants and DevRevStep_CLASSHOT. Candidate step-like columns: $stepLikePreview"
     }
     if (-not $programColumn) {
         Write-Warning "Could not find a program-name column in the AQUA output. Falling back to UNKNOWN_PROGRAM for output naming."
@@ -786,8 +808,16 @@ try {
         throw "Could not find a visual-unit column in the AQUA output."
     }
 
+    Write-Host "Process-step column: $stepColumn (filter mode: $stepFilterMode)"
+
     $filteredRows = $rows | Where-Object {
-        $_.$lotColumn -notlike "*MV" -and $_.$stepColumn -eq "Classhot"
+        if ($_.$lotColumn -like "*MV") { return $false }
+        if ($stepFilterMode -eq "EqClasshot") {
+            return $_.$stepColumn -eq "Classhot"
+        }
+        else {
+            return -not [string]::IsNullOrWhiteSpace([string]$_.$stepColumn)
+        }
     }
 
     if (-not $filteredRows -or $filteredRows.Count -eq 0) {
@@ -815,17 +845,15 @@ try {
     $safeProgram = Get-SafeFileNamePart -Value $mostAbundantProgram
 
     $now = Get-Date
-    $isoInfo = Get-IsoWeekYear -Date $now
-    $isoWeek = $isoInfo.Week
-    $year = $isoInfo.Year
-    $csvName = "Vmin_{0}_WW{1:D2}_{2}.csv" -f $safeProgram, $isoWeek, $year
+    $dateStamp = $now.ToString("yyyyMMdd")
+    $csvName = "Vmin_{0}.csv" -f $dateStamp
     $csvPath = Join-Path $OutputDirectory $csvName
 
     $filteredRows | Export-Csv -LiteralPath $tempCleanFile -NoTypeInformation
     $filteredRows | Export-Csv -LiteralPath $tempMergedWorkFile -NoTypeInformation
 
     if ($KeepCleanCsvArtifact) {
-        $cleanCsvName = "Vmin_{0}_WW{1:D2}_{2}_clean.csv" -f $safeProgram, $isoWeek, $year
+        $cleanCsvName = "Vmin_{0}_clean.csv" -f $dateStamp
         $cleanCsvPath = Join-Path $OutputDirectory $cleanCsvName
         Copy-Item -LiteralPath $tempCleanFile -Destination $cleanCsvPath -Force
     }
@@ -980,7 +1008,15 @@ catch {
     throw
 }
 finally {
-    $healthLogPath = Join-Path $OutputDirectory "Weekly_Run_Health.csv"
+    # Cleanup intermediate files - keep only final merged CSV
+    Get-ChildItem -LiteralPath $OutputDirectory -Filter "_raw_*.csv" -File -ErrorAction SilentlyContinue | Remove-Item -Force
+    Get-ChildItem -LiteralPath $OutputDirectory -Filter "_clean_*.csv" -File -ErrorAction SilentlyContinue | Remove-Item -Force
+    Get-ChildItem -LiteralPath $OutputDirectory -Filter "_merged_work_*.csv" -File -ErrorAction SilentlyContinue | Remove-Item -Force
+    Get-ChildItem -LiteralPath $OutputDirectory -Filter "Weekly_Run_Status.csv" -File -ErrorAction SilentlyContinue | Remove-Item -Force
+    Get-ChildItem -LiteralPath $OutputDirectory -Filter "Weekly_Run_Health.csv" -File -ErrorAction SilentlyContinue | Remove-Item -Force
+    Get-ChildItem -LiteralPath $OutputDirectory -Filter "Vmin_*_clean.csv" -File -ErrorAction SilentlyContinue | Remove-Item -Force
+    
+    $healthLogPath = Join-Path $OutputDirectory ("Vmin_{0}_health.csv" -f $dateStamp)
     Write-HealthLog `
         -HealthLogPath $healthLogPath `
         -RunStart $runStart `

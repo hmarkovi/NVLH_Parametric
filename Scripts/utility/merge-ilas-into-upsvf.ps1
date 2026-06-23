@@ -139,42 +139,48 @@ Write-Host ""
 Write-Host "Merging..." -ForegroundColor Cyan
 $matchCount = 0
 $noMatchCount = 0
-$mergedRows = @()
+# Stream rows to Export-Csv to avoid large in-memory growth from "$mergedRows += ...".
+$mergedRowCount = 0
 
-foreach ($row in $upsvfRows) {
-    $vid = [string]($row.$upsvfVidCol).Trim().ToUpperInvariant()
-    $lot = [string]($row.$upsvfLotCol).Trim().ToUpperInvariant()
-    $key = "$vid||$lot"
-    
-    # Create new PSObject with all UPSVF columns
-    $mergedRow = $row.PSObject.Copy()
-    
-    # Add ILAS columns (even if empty)
-    if ($ilasLookup.ContainsKey($key)) {
-        $ilasRow = $ilasLookup[$key]
-        foreach ($col in $ilasDataColumns) {
-            $mergedRow | Add-Member -MemberType NoteProperty -Name "ILAS_$col" -Value $ilasRow.$col -Force
+$upsvfRows |
+    ForEach-Object {
+        $row = $_
+        $vid = [string]($row.$upsvfVidCol).Trim().ToUpperInvariant()
+        $lot = [string]($row.$upsvfLotCol).Trim().ToUpperInvariant()
+        $key = "$vid||$lot"
+
+        # Keep original UPSVF columns first, then append ILAS_* columns.
+        $mergedMap = [ordered]@{}
+        foreach ($prop in $row.PSObject.Properties) {
+            $mergedMap[$prop.Name] = $prop.Value
         }
-        $matchCount++
-    } else {
-        # Add empty ILAS columns for unmatched rows
-        foreach ($col in $ilasDataColumns) {
-            $mergedRow | Add-Member -MemberType NoteProperty -Name "ILAS_$col" -Value "" -Force
+
+        if ($ilasLookup.ContainsKey($key)) {
+            $ilasRow = $ilasLookup[$key]
+            foreach ($col in $ilasDataColumns) {
+                $mergedMap["ILAS_$col"] = $ilasRow.$col
+            }
+            $matchCount++
         }
-        $noMatchCount++
-    }
-    
-    $mergedRows += $mergedRow
-}
+        else {
+            foreach ($col in $ilasDataColumns) {
+                $mergedMap["ILAS_$col"] = ""
+            }
+            $noMatchCount++
+        }
+
+        $mergedRowCount++
+        [pscustomobject]$mergedMap
+    } |
+    Export-Csv -LiteralPath $OutputCsv -NoTypeInformation -Encoding UTF8
 
 Write-Host "Matched rows with ILAS data: $matchCount"
 Write-Host "Unmatched rows (ILAS columns empty): $noMatchCount"
-Write-Host "Total merged rows: $($mergedRows.Count)"
+Write-Host "Total merged rows: $mergedRowCount"
 Write-Host ""
 
 # ===== WRITE OUTPUT =====
 Write-Host "Writing merged CSV..." -ForegroundColor Cyan
-$mergedRows | Export-Csv -LiteralPath $OutputCsv -NoTypeInformation -Encoding UTF8
 
 $outputFile = Get-Item -LiteralPath $OutputCsv
 $sizeMB = [math]::Round($outputFile.Length / 1MB, 2)

@@ -31,6 +31,7 @@ param(
     [int]$AquaMaxRows = 0,
     [int]$AquaPullTimeoutSeconds = 3600,
     [int]$AquaPullPollSeconds = 15,
+    [int]$MaxVisualIdsPerQuery = 1500,
     [double]$MinValidVmin = 0.2,
     [double]$MaxValidVmin = 2.0,
     [string]$UpsvfReferenceCsv = "",
@@ -89,9 +90,10 @@ function Get-VisualLotReference {
         throw "UpsvfReferenceCsv is missing a lot/class-lot column (for example LOTFROMFS)."
     }
 
-    $keySet = New-Object 'System.Collections.Generic.HashSet[string]'
-    $vidSet = New-Object 'System.Collections.Generic.HashSet[string]'
-    $lotSet = New-Object 'System.Collections.Generic.HashSet[string]'
+    # Use case-insensitive sets to avoid dropping matches when AQUA and UPSVF casing differs.
+    $keySet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    $vidSet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    $lotSet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
 
     foreach ($row in $rows) {
         $vid = [string]$row.$vidCol
@@ -100,9 +102,11 @@ function Get-VisualLotReference {
             continue
         }
 
-        [void]$keySet.Add(("{0}||{1}" -f $vid.Trim(), $lot.Trim()))
-        [void]$vidSet.Add($vid.Trim())
-        [void]$lotSet.Add($lot.Trim())
+        $vidNorm = $vid.Trim()
+        $lotNorm = $lot.Trim()
+        [void]$keySet.Add(("{0}||{1}" -f $vidNorm, $lotNorm))
+        [void]$vidSet.Add($vidNorm)
+        [void]$lotSet.Add($lotNorm)
     }
 
     return [pscustomobject]@{
@@ -112,6 +116,89 @@ function Get-VisualLotReference {
         UpsvfVisualColumn = $vidCol
         UpsvfLotColumn = $lotCol
     }
+}
+
+function Get-UniqueValueCount {
+    param(
+        [object[]]$Rows,
+        [string]$ColumnName
+    )
+
+    if (-not $Rows -or $Rows.Count -eq 0 -or [string]::IsNullOrWhiteSpace($ColumnName)) {
+        return 0
+    }
+
+    # Guard against strict-mode crash when column doesn't exist on the objects
+    if ($null -eq $Rows[0].PSObject.Properties[$ColumnName]) {
+        return 0
+    }
+
+    $set = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($row in $Rows) {
+        $val = [string]$row.$ColumnName
+        if ([string]::IsNullOrWhiteSpace($val)) { continue }
+        [void]$set.Add($val.Trim())
+    }
+
+    return $set.Count
+}
+
+function Invoke-IlasAquaPull {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$AquaExePath,
+        [Parameter(Mandatory = $true)]
+        [string]$AquaServerValue,
+        [Parameter(Mandatory = $true)]
+        [string]$ReportPathValue,
+        [Parameter(Mandatory = $true)]
+        [string]$OutputFilePath,
+        [Parameter(Mandatory = $true)]
+        [string]$ProgramPatternValue,
+        [Parameter(Mandatory = $true)]
+        [string]$OperationsValue,
+        [Parameter(Mandatory = $true)]
+        [string]$FunctionalBinValue,
+        [Parameter(Mandatory = $true)]
+        [string[]]$LotArgs,
+        [string[]]$VisualIdArgs = @(),
+        [int]$AquaMaxRowsValue = 0,
+        [int]$LastNDaysTestEndValue = 0,
+        [switch]$AllowLastNDays,
+        [int]$TimeoutSeconds = 3600,
+        [int]$PollSeconds = 15
+    )
+
+    $aquaArgs = @(
+        "-aquaserver", $AquaServerValue,
+        "-reportpath", $ReportPathValue,
+        "-outputfilename", $OutputFilePath,
+        "-programNames", $ProgramPatternValue,
+        "-operations", $OperationsValue,
+        "-UnitFunctionalBin", $FunctionalBinValue
+    )
+
+    if ($AquaMaxRowsValue -gt 0) {
+        $aquaArgs += @("-dataSampling", [string]$AquaMaxRowsValue)
+    }
+    if ($VisualIdArgs.Count -gt 0) {
+        $aquaArgs += $VisualIdArgs
+    }
+    $aquaArgs += $LotArgs
+
+    if ($AllowLastNDays.IsPresent -and $LastNDaysTestEndValue -gt 0) {
+        $aquaArgs += @("-lastNDaysTestEnd", [string]$LastNDaysTestEndValue)
+    }
+
+    & $AquaExePath @aquaArgs
+
+    Write-Host "Waiting for AQUA output file to be ready..."
+    $isReady = Wait-ForFileReady -Path $OutputFilePath -TimeoutSeconds $TimeoutSeconds -PollSeconds $PollSeconds
+    if (-not $isReady) {
+        throw "AQUA ILAS output was not ready within $TimeoutSeconds seconds: $OutputFilePath"
+    }
+
+    Assert-NonEmptyFile -Path $OutputFilePath -Label "AQUA ILAS output"
 }
 
 function Get-IsoWeekYear {
@@ -487,6 +574,7 @@ $runStart = Get-Date
 $tempRawFile = ""
 $pulledRawInThisRun = $false
 $reference = $null
+$rawRows = @()
 
 try {
     if (-not (Test-Path -LiteralPath $OutputDirectory)) {
@@ -501,14 +589,26 @@ try {
 
     $visualIdArg = @()
     if ($reference -and $reference.VisualIds.Count -gt 0) {
-        $visualIdsCsv = ($reference.VisualIds -join ",")
-        # Keep a safety margin for command line length.
-        if ($visualIdsCsv.Length -lt 7000) {
-            $visualIdArg = @("-visualIds", $visualIdsCsv)
-            Write-Host ("Using {0} VisualID(s) from UPSVF reference for ILAS pull." -f $reference.VisualIds.Count)
+        $allVisualIds = @($reference.VisualIds)
+        # Normalize all Visual IDs to uppercase for consistency with UPSVF matching
+        $normalizedIds = @()
+        foreach ($vid in $allVisualIds) {
+            $normalized = ([string]$vid).Trim().ToUpperInvariant()
+            if (-not [string]::IsNullOrWhiteSpace($normalized)) {
+                $normalizedIds += $normalized
+            }
         }
-        else {
-            Write-Warning ("UPSVF VisualID list is too large for safe command-line usage ({0} chars). Falling back to lot-based pull + post-filtering." -f $visualIdsCsv.Length)
+        if ($normalizedIds.Count -gt 0) {
+            $visualIdsCsv = ($normalizedIds -join ",")
+            # Native process invocation on Windows fails when the command line gets too long.
+            # If this happens, pull by lot only and apply exact VisualID+lot post-filtering.
+            if ($visualIdsCsv.Length -le 7000) {
+                $visualIdArg = @("-visualIds", $visualIdsCsv)
+                Write-Host ("Using {0} VisualID(s) from UPSVF reference for single ILAS pull." -f $normalizedIds.Count)
+            }
+            else {
+                Write-Host ("VisualID argument length ({0}) exceeds safe command-line size. Falling back to lot-only single pull with exact post-filtering to UPSVF keys." -f $visualIdsCsv.Length)
+            }
         }
     }
 
@@ -532,47 +632,60 @@ try {
         if (-not (Test-Path -LiteralPath $AquaExe)) { throw "Aqua executable not found: $AquaExe" }
 
         Write-Host "Pulling ILAS VMIN_DTS from AQUA..."
-        $aquaArgs = @(
-            "-aquaserver", $AquaServer,
-            "-reportpath", $IlasReportPath,
-            "-outputfilename", $tempRawFile,
-            "-programNames", $ProgramPattern,
-            "-operations", $Operations,
-            "-UnitFunctionalBin", $FunctionalBin
-        )
-        if ($AquaMaxRows -gt 0) {
-            $aquaArgs += @("-dataSampling", [string]$AquaMaxRows)
+        if ($hasSpecificFilter) {
+            if ($visualIdArg.Count -gt 0) {
+                Write-Host "ILAS AQUA query filter mode: VisualID filter + lot filter."
+            }
+            else {
+                Write-Host "ILAS AQUA query filter mode: lot filter only."
+            }
         }
-        if ($visualIdArg.Count -gt 0) {
-            $aquaArgs += $visualIdArg
-        }
-        $aquaArgs += $lotArgs
-        if ((-not $hasSpecificFilter) -and $LastNDaysTestEnd -gt 0) {
-            $aquaArgs += @("-lastNDaysTestEnd", [string]$LastNDaysTestEnd)
+        elseif ($LastNDaysTestEnd -gt 0) {
             Write-Host ("ILAS AQUA query filter mode: LastNDaysTestEnd={0}" -f $LastNDaysTestEnd)
         }
-        else {
-            Write-Host "ILAS AQUA query filter mode: specific lot/VisualID filter only."
-        }
 
-        & $AquaExe @aquaArgs
-
-        Write-Host "Waiting for AQUA output file to be ready..."
-        $isReady = Wait-ForFileReady -Path $tempRawFile -TimeoutSeconds $AquaPullTimeoutSeconds -PollSeconds $AquaPullPollSeconds
-        if (-not $isReady) { throw "AQUA ILAS output was not ready within $AquaPullTimeoutSeconds seconds: $tempRawFile" }
+        Invoke-IlasAquaPull `
+            -AquaExePath $AquaExe `
+            -AquaServerValue $AquaServer `
+            -ReportPathValue $IlasReportPath `
+            -OutputFilePath $tempRawFile `
+            -ProgramPatternValue $ProgramPattern `
+            -OperationsValue $Operations `
+            -FunctionalBinValue $FunctionalBin `
+            -LotArgs $lotArgs `
+            -VisualIdArgs $visualIdArg `
+            -AquaMaxRowsValue $AquaMaxRows `
+            -LastNDaysTestEndValue $LastNDaysTestEnd `
+            -AllowLastNDays:($hasSpecificFilter -eq $false -and $LastNDaysTestEnd -gt 0) `
+            -TimeoutSeconds $AquaPullTimeoutSeconds `
+            -PollSeconds $AquaPullPollSeconds
 
         $sourceRawFile = $tempRawFile
         $pulledRawInThisRun = $true
         Write-Host "AQUA pull complete: $sourceRawFile"
     }
 
-    $rawRows = @(Import-Csv -LiteralPath $sourceRawFile)
+    if (-not $rawRows) {
+        $rawRows = @(Import-Csv -LiteralPath $sourceRawFile)
+    }
     if ($rawRows.Count -eq 0) { throw "ILAS raw file is empty: $sourceRawFile" }
     Write-Host ("Loaded {0} rows from ILAS file." -f $rawRows.Count)
 
+    $rawUnitsBefore = Get-UniqueValueCount -Rows $rawRows -ColumnName "Visual ID"
+    if ($rawUnitsBefore -eq 0) {
+        $rawUnitsBefore = Get-UniqueValueCount -Rows $rawRows -ColumnName "VISUAL_ID"
+    }
+    Write-Host ("ILAS stage: raw rows={0}, unique units={1}" -f $rawRows.Count, $rawUnitsBefore)
+
     $rawRows = @(Filter-RowsByOpergroup -Rows $rawRows -OpergroupFilterValue $OpergroupFilter)
+    $opUnits = Get-UniqueValueCount -Rows $rawRows -ColumnName "Visual ID"
+    if ($opUnits -eq 0) { $opUnits = Get-UniqueValueCount -Rows $rawRows -ColumnName "VISUAL_ID" }
+    Write-Host ("ILAS stage: after opergroup rows={0}, unique units={1}" -f $rawRows.Count, $opUnits)
 
     $rawRows = @(Filter-RowsByTestNameSuffix -Rows $rawRows -ExcludeSuffixes @("_it", "_scrb"))
+    $suffixUnits = Get-UniqueValueCount -Rows $rawRows -ColumnName "Visual ID"
+    if ($suffixUnits -eq 0) { $suffixUnits = Get-UniqueValueCount -Rows $rawRows -ColumnName "VISUAL_ID" }
+    Write-Host ("ILAS stage: after suffix filter rows={0}, unique units={1}" -f $rawRows.Count, $suffixUnits)
 
     $allColumns = $rawRows[0].PSObject.Properties.Name
 
@@ -595,6 +708,8 @@ try {
             }
         )
         Write-Host ("Filtered ILAS rows by UPSVF VisualID+lot keys: {0} -> {1}" -f $before, $rawRows.Count)
+        $keyUnits = Get-UniqueValueCount -Rows $rawRows -ColumnName $visualIdColumn
+        Write-Host ("ILAS stage: after key filter unique units={0}" -f $keyUnits)
         if ($rawRows.Count -eq 0) {
             throw "No ILAS rows remain after applying UPSVF VisualID+lot filtering."
         }
