@@ -70,21 +70,12 @@ Remove-Item -LiteralPath $tmpPath -Force -ErrorAction SilentlyContinue
 - **Artifact Retention**: 366 days (default `RetentionDays = 366`)
 - **Data Sampling Cap**: 150,000 rows per Aqua pull (default `AquaMaxRows = 150000`)
 
-## Setup Instructions: Enable Sunday 5:00 AM Automation
+## Setup Instructions: Enable Automation For The Canonical Runner
 
-### Option 1: PowerShell Script (Recommended)
-```powershell
-# Run as Administrator
-& "c:\Projects\NVL\.docs\Scripts\data-pulling\weekly-aqua-pull\schedule-weekly-run.ps1"
-```
+The only saved runner that should produce the weekly CSV output is `aqua_nvlh_weekly_pull.ps1`.
+Redundant scheduler wrapper scripts were removed from the repo during cleanup.
 
-**What this does**:
-1. Creates Task Scheduler task named "NVL UPSVF Weekly Pull"
-2. Sets trigger: Every Sunday at 5:00 AM
-3. Configures action: Run aqua_nvlh_weekly_pull.ps1 with ILAS analysis
-4. Enables network availability check and task restart
-
-### Option 2: Manual Task Scheduler Setup
+### Manual Task Scheduler Setup
 1. Open Task Scheduler (tasksched.msc)
 2. Right-click Task Scheduler Library → Create Basic Task
 3. **Name**: "NVL UPSVF Weekly Pull"
@@ -135,8 +126,7 @@ Remove-Item -LiteralPath $tmpPath -Force -ErrorAction SilentlyContinue
    - Added: Documentation header
    - (Merge fix already applied in prior session)
 
-3. `Scripts/data-pulling/weekly-aqua-pull/schedule-weekly-run.ps1` (NEW)
-   - Created: Task Scheduler setup script
+3. Task Scheduler should call `Scripts/data-pulling/weekly-aqua-pull/aqua_nvlh_weekly_pull.ps1` directly
 
 ## Testing the Automation
 ```powershell
@@ -156,11 +146,11 @@ $ilas='c:\Projects\NVL\.docs\Scripts\parametric-analysis\ilas\aqua_nvlh_ilas_vmi
 | "Cannot create a file when that file already exists" | Stale .tmp from failed run | Already fixed with Copy-Item -Force + cleanup |
 | Test names ending in _it/_scrb still in output | Filter not applied | Verify ILAS script updated (line ~544) |
 | CLASSHOT data missing | Opergroup filter not applied | Check OpergroupFilter default = "6248_CLASSHOT" |
-| Task doesn't run | Task not enabled in Scheduler | Run schedule-weekly-run.ps1 as Administrator |
+| Task doesn't run | Task not enabled in Scheduler | Recreate the Task Scheduler entry to call aqua_nvlh_weekly_pull.ps1 directly |
 | Insufficient permissions | Non-admin task scheduler | Required for WinRM/AQUA access; contact IT if needed |
 
 ## Next Steps
-1. Run `schedule-weekly-run.ps1` as Administrator to enable Sunday 5:00 AM automation
+1. Ensure Task Scheduler points directly to `aqua_nvlh_weekly_pull.ps1`
 2. Monitor first run logs in `\\ger\ec\proj\ha\mmgbd\MMGBD_PSA\Products\NVL\NVL-H\Weekly Runs\Weekly_Run_Log_*.log`
 3. Verify ILAS columns present in final merged CSV
 4. Adjust data retention or sampling limits if needed (in script parameters)
