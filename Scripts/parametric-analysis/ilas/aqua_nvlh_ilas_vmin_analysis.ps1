@@ -251,6 +251,40 @@ function Wait-ForFileReady {
     return $false
 }
 
+function Get-RandomVisualIdSubsetForAqua {
+    param(
+        [string[]]$VisualIds,
+        [int]$TargetCount = 1500,
+        [int]$MaxArgumentLength = 32000
+    )
+
+    if (-not $VisualIds -or $VisualIds.Count -eq 0) {
+        return @()
+    }
+
+    $normalized = @()
+    foreach ($visualId in $VisualIds) {
+        $candidate = ([string]$visualId).Trim().ToUpperInvariant()
+        if (-not [string]::IsNullOrWhiteSpace($candidate)) {
+            $normalized += $candidate
+        }
+    }
+
+    if ($normalized.Count -eq 0) {
+        return @()
+    }
+
+    $subsetCount = [Math]::Min($TargetCount, $normalized.Count)
+    $subset = @($normalized | Get-Random -Count $subsetCount)
+
+    # Keep a single-query model while ensuring command-line safety.
+    while ($subset.Count -gt 1 -and (($subset -join ",").Length -gt $MaxArgumentLength)) {
+        $subset = @($subset | Select-Object -First ($subset.Count - 1))
+    }
+
+    return $subset
+}
+
 function Parse-VminFwCfg {
     param([string]$CfgValue)
     $result = @()
@@ -570,7 +604,6 @@ function Filter-RowsByTestNameSuffix {
     return $filtered
 }
 
-$runStart = Get-Date
 $tempRawFile = ""
 $pulledRawInThisRun = $false
 $reference = $null
@@ -590,24 +623,16 @@ try {
     $visualIdArg = @()
     if ($reference -and $reference.VisualIds.Count -gt 0) {
         $allVisualIds = @($reference.VisualIds)
-        # Normalize all Visual IDs to uppercase for consistency with UPSVF matching
-        $normalizedIds = @()
-        foreach ($vid in $allVisualIds) {
-            $normalized = ([string]$vid).Trim().ToUpperInvariant()
-            if (-not [string]::IsNullOrWhiteSpace($normalized)) {
-                $normalizedIds += $normalized
-            }
-        }
-        if ($normalizedIds.Count -gt 0) {
-            $visualIdsCsv = ($normalizedIds -join ",")
-            # Native process invocation on Windows fails when the command line gets too long.
-            # If this happens, pull by lot only and apply exact VisualID+lot post-filtering.
-            if ($visualIdsCsv.Length -le 7000) {
-                $visualIdArg = @("-visualIds", $visualIdsCsv)
-                Write-Host ("Using {0} VisualID(s) from UPSVF reference for single ILAS pull." -f $normalizedIds.Count)
+        $selectedVisualIds = @(Get-RandomVisualIdSubsetForAqua -VisualIds $allVisualIds -TargetCount $MaxVisualIdsPerQuery -MaxArgumentLength 32000)
+        if ($selectedVisualIds.Count -gt 0) {
+            $visualIdsCsv = ($selectedVisualIds -join ",")
+            $visualIdArg = @("-visualIds", $visualIdsCsv)
+
+            if ($allVisualIds.Count -gt $selectedVisualIds.Count) {
+                Write-Host ("Using random VisualID subset for ILAS pull: selected {0} out of {1} UPSVF VisualID(s)." -f $selectedVisualIds.Count, $allVisualIds.Count)
             }
             else {
-                Write-Host ("VisualID argument length ({0}) exceeds safe command-line size. Falling back to lot-only single pull with exact post-filtering to UPSVF keys." -f $visualIdsCsv.Length)
+                Write-Host ("Using all {0} UPSVF VisualID(s) for ILAS pull." -f $selectedVisualIds.Count)
             }
         }
     }
@@ -903,7 +928,9 @@ try {
     Write-Host ("Detail rows : {0}" -f $allRecords.Count)
 }
 finally {
-    if ($pulledRawInThisRun -and $tempRawFile -ne "" -and (Test-Path -LiteralPath $tempRawFile)) {
-        Remove-Item -LiteralPath $tempRawFile -Force -ErrorAction SilentlyContinue
+    if ($pulledRawInThisRun) {
+        if (-not [string]::IsNullOrWhiteSpace($tempRawFile) -and (Test-Path -LiteralPath $tempRawFile)) {
+            Remove-Item -LiteralPath $tempRawFile -Force -ErrorAction SilentlyContinue
+        }
     }
 }
