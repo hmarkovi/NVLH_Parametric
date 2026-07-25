@@ -25,7 +25,7 @@ param(
     [string]$OpergroupFilter = "6248_CLASSHOT",
     [string]$ProgramPattern = "NVLHM66*",
     [string]$Operations = "6248",
-    [string]$OutputDirectory = "\\ger\ec\proj\ha\mmgbd\MMGBD_PSA\Products\NVL\NVL-H\Weekly Runs",
+    [string]$OutputDirectory = "\\ger\ec\proj\ha\mmgbd\MMGBD_PSA\Products\NVL\NVL-H\Analysis",
     [string]$FunctionalBin = "100",
     [int]$LastNDaysTestEnd = 7,
     [int]$AquaMaxRows = 0,

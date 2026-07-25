@@ -39,6 +39,8 @@ param(
     [string]$ProgramPattern = "NVLHM66*",
     [string]$Operations = "6248",
     [string]$OutputDirectory = "\\ger\ec\proj\ha\mmgbd\MMGBD_PSA\Products\NVL\NVL-H\Weekly Runs",
+    [bool]$UseRunSubdirectory = $true,
+    [string]$RunFolderPrefix = "weekly_upsvf_ilas",
     [string]$FunctionalBin = "100",
     [int]$LastNDaysTestEnd = 7,
     [int]$RetentionDays = 366,
@@ -746,11 +748,20 @@ try {
         throw "Aqua executable not found: $AquaExe"
     }
 
+    $runStamp = Get-Date -Format "yyyyMMdd_HHmmss"
+    $baseOutputDirectory = $OutputDirectory
+    if (-not (Test-Path -LiteralPath $baseOutputDirectory)) {
+        New-Item -Path $baseOutputDirectory -ItemType Directory -Force | Out-Null
+    }
+
+    if ($UseRunSubdirectory) {
+        $OutputDirectory = Join-Path $baseOutputDirectory ("{0}_{1}" -f $RunFolderPrefix, $runStamp)
+    }
+
     if (-not (Test-Path -LiteralPath $OutputDirectory)) {
         New-Item -Path $OutputDirectory -ItemType Directory -Force | Out-Null
     }
 
-    $runStamp = Get-Date -Format "yyyyMMdd_HHmmss"
     $retentionCutoff = (Get-Date).AddDays(-$RetentionDays)
     $tempRawFile = Join-Path $OutputDirectory ("_raw_{0}.csv" -f $runStamp)
     $tempCleanFile = Join-Path $OutputDirectory ("_clean_{0}.csv" -f $runStamp)

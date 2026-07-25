@@ -2,6 +2,10 @@
 # Keep runtime/heavy artifacts out of source control.
 development/validation/
 
+# Runtime analysis artifacts should never be committed from the repo tree.
+*.csv
+*.png
+
 # Additional runtime artifacts under development validation runs.
 development/**/_automation_logs/
 development/**/_ilas_weekly_*/
