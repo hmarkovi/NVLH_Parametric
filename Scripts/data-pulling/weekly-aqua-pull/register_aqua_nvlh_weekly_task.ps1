@@ -1,6 +1,6 @@
 param(
     [string]$TaskName = "Aqua NVLH Weekly Pull",
-    [string]$ScriptPath = "c:\Projects\NVL\.docs\Scripts\data-pulling\weekly-aqua-pull\aqua_nvlh_weekly_pull.ps1"
+    [string]$ScriptPath = "C:\Users\hmarkovi\Downloads\NVLH_Parametric-main\NVLH_Parametric-main\Scripts\data-pulling\weekly-aqua-pull\aqua_nvlh_weekly_pull.ps1"
 )
 
 Set-StrictMode -Version Latest

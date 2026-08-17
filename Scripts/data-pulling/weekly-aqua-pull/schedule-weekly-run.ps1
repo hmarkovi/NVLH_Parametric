@@ -21,8 +21,8 @@ Action: PowerShell script execution with ILAS analysis and merge
 #Requires -RunAsAdministrator
 
 param(
-    [string]$WeeklyScriptPath = "c:\Projects\NVL\.docs\Scripts\data-pulling\weekly-aqua-pull\aqua_nvlh_weekly_pull.ps1",
-    [string]$IlasScriptPath = "c:\Projects\NVL\.docs\Scripts\parametric-analysis\ilas\aqua_nvlh_ilas_vmin_analysis.ps1",
+    [string]$WeeklyScriptPath = "C:\Users\hmarkovi\Downloads\NVLH_Parametric-main\NVLH_Parametric-main\Scripts\data-pulling\weekly-aqua-pull\aqua_nvlh_weekly_pull.ps1",
+    [string]$IlasScriptPath = "C:\Users\hmarkovi\Downloads\NVLH_Parametric-main\NVLH_Parametric-main\Scripts\parametric-analysis\ilas\aqua_nvlh_ilas_vmin_analysis.ps1",
     [string]$OutputDirectory = "\\ger\ec\proj\ha\mmgbd\MMGBD_PSA\Products\NVL\NVL-H\Weekly Runs",
     [string]$TaskName = "NVL UPSVF Weekly Pull",
     [string]$TaskDescription = "Weekly UPSVF pull from AQUA with ILAS analysis and column merge (Sunday 5:00 AM)"

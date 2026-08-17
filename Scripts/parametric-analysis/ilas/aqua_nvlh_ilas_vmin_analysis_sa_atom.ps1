@@ -32,12 +32,16 @@ param(
     [int]$AquaPullTimeoutSeconds = 3600,
     [int]$AquaPullPollSeconds = 15,
     [int]$MaxVisualIdsPerQuery = 1500,
+    [int]$MaxVisualIdArgumentLength = 32000,
+    [int]$MaxLotsPerQuery = 20,
     [double]$MinValidVmin = 0.2,
     [double]$MaxValidVmin = 2.0,
     [string]$UpsvfReferenceCsv = "",
     [string]$RawInputFile = "",
     [string]$LotsOverride = "",
-    [switch]$UseLotFilterOnlyQuery
+    [string]$VisualIdsOverride = "",
+    [string]$TestNameIncludeTokens = "SAAT,VCCLPECORE,LPATOM",
+    [string]$OutputTag = "SAATOM"
 )
 
 Set-StrictMode -Version Latest
@@ -154,7 +158,9 @@ function Invoke-IlasAquaPull {
         [string]$ReportPathValue,
         [Parameter(Mandatory = $true)]
         [string]$OutputFilePath,
+        [Parameter(Mandatory = $true)]
         [string]$ProgramPatternValue,
+        [Parameter(Mandatory = $true)]
         [string]$OperationsValue,
         [Parameter(Mandatory = $true)]
         [string]$FunctionalBinValue,
@@ -172,15 +178,10 @@ function Invoke-IlasAquaPull {
         "-aquaserver", $AquaServerValue,
         "-reportpath", $ReportPathValue,
         "-outputfilename", $OutputFilePath,
+        "-programNames", $ProgramPatternValue,
+        "-operations", $OperationsValue,
         "-UnitFunctionalBin", $FunctionalBinValue
     )
-
-    if (-not [string]::IsNullOrWhiteSpace($ProgramPatternValue)) {
-        $aquaArgs += @("-programNames", $ProgramPatternValue)
-    }
-    if (-not [string]::IsNullOrWhiteSpace($OperationsValue)) {
-        $aquaArgs += @("-operations", $OperationsValue)
-    }
 
     if ($AquaMaxRowsValue -gt 0) {
         $aquaArgs += @("-dataSampling", [string]$AquaMaxRowsValue)
@@ -253,6 +254,134 @@ function Wait-ForFileReady {
         Start-Sleep -Seconds $PollSeconds
     }
     return $false
+}
+
+function Resolve-AquaExePathForAutomation {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$SourceAquaExePath
+    )
+
+    $cacheDir = Join-Path $env:LOCALAPPDATA "NVLH\AquaCmdLine"
+    $cachedExe = Join-Path $cacheDir "AquaCmdLine.exe"
+
+    if (-not (Test-Path -LiteralPath $cacheDir)) {
+        New-Item -Path $cacheDir -ItemType Directory -Force | Out-Null
+    }
+
+    $needsCopy = $false
+    if (-not (Test-Path -LiteralPath $cachedExe)) {
+        $needsCopy = $true
+    }
+    else {
+        $sourceInfo = Get-Item -LiteralPath $SourceAquaExePath
+        $cachedInfo = Get-Item -LiteralPath $cachedExe
+        if ($sourceInfo.LastWriteTime -gt $cachedInfo.LastWriteTime) {
+            $needsCopy = $true
+        }
+    }
+
+    if ($needsCopy) {
+        Copy-Item -LiteralPath $SourceAquaExePath -Destination $cachedExe -Force | Out-Null
+        Unblock-File -LiteralPath $cachedExe -ErrorAction SilentlyContinue
+    }
+
+    return $cachedExe
+}
+
+function Get-VisualIdChunksForAqua {
+    param(
+        [string[]]$VisualIds,
+        [int]$MaxPerChunk = 1500,
+        [int]$MaxArgumentLength = 32000
+    )
+
+    if (-not $VisualIds -or $VisualIds.Count -eq 0) {
+        return @()
+    }
+
+    $normalizedSet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($visualId in $VisualIds) {
+        $candidate = ([string]$visualId).Trim().ToUpperInvariant()
+        if (-not [string]::IsNullOrWhiteSpace($candidate)) {
+            [void]$normalizedSet.Add($candidate)
+        }
+    }
+
+    $normalized = @($normalizedSet)
+    if ($normalized.Count -eq 0) {
+        return @()
+    }
+
+    $allIds = @($normalized | Sort-Object)
+    $chunks = New-Object System.Collections.Generic.List[object]
+    $current = New-Object System.Collections.Generic.List[string]
+    $currentLen = 0
+
+    foreach ($id in $allIds) {
+        $pieceLen = $id.Length
+        if ($current.Count -gt 0) {
+            $pieceLen += 1
+        }
+
+        $wouldExceedCount = ($MaxPerChunk -gt 0 -and $current.Count -ge $MaxPerChunk)
+        $wouldExceedLength = ($MaxArgumentLength -gt 0 -and ($currentLen + $pieceLen) -gt $MaxArgumentLength)
+
+        if ($current.Count -gt 0 -and ($wouldExceedCount -or $wouldExceedLength)) {
+            $chunks.Add(@($current))
+            $current = New-Object System.Collections.Generic.List[string]
+            $currentLen = 0
+        }
+
+        $current.Add($id)
+        if ($currentLen -gt 0) {
+            $currentLen += 1
+        }
+        $currentLen += $id.Length
+    }
+
+    if ($current.Count -gt 0) {
+        $chunks.Add(@($current))
+    }
+
+    return @($chunks.ToArray())
+}
+
+function Split-ValuesIntoChunks {
+    param(
+        [string[]]$Values,
+        [int]$MaxPerChunk = 20
+    )
+
+    if (-not $Values -or $Values.Count -eq 0) {
+        return @()
+    }
+
+    $clean = @(
+        $Values |
+            ForEach-Object { ([string]$_).Trim().ToUpperInvariant() } |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+            Select-Object -Unique
+    )
+
+    if ($clean.Count -eq 0) {
+        return @()
+    }
+
+    if ($MaxPerChunk -le 0) {
+        return @(@($clean))
+    }
+
+    $chunks = New-Object System.Collections.Generic.List[object]
+    $index = 0
+    while ($index -lt $clean.Count) {
+        $take = [Math]::Min($MaxPerChunk, $clean.Count - $index)
+        $chunk = @($clean[$index..($index + $take - 1)])
+        $chunks.Add($chunk)
+        $index += $take
+    }
+
+    return @($chunks.ToArray())
 }
 
 function Parse-VminFwCfg {
@@ -574,6 +703,57 @@ function Filter-RowsByTestNameSuffix {
     return $filtered
 }
 
+function Filter-RowsByTestNameContainsTokens {
+    param(
+        [object[]]$Rows,
+        [string[]]$IncludeTokens
+    )
+
+    if (-not $Rows -or $Rows.Count -eq 0) {
+        return @()
+    }
+
+    $tokens = @(
+        $IncludeTokens |
+            ForEach-Object { ([string]$_).Trim().ToUpperInvariant() } |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+
+    if ($tokens.Count -eq 0) {
+        Write-Warning "No include tokens provided; skipping test instance include filter."
+        return $Rows
+    }
+
+    $cols = $Rows[0].PSObject.Properties.Name
+    $testNameCol = @("TEST_NAME", "Test Name", "TESTNAME", "TestName") |
+        Where-Object { $cols -contains $_ } | Select-Object -First 1
+
+    if (-not $testNameCol) {
+        Write-Warning "TEST_NAME column not found; skipping test instance include filter."
+        return $Rows
+    }
+
+    $before = $Rows.Count
+    $filtered = @(
+        $Rows | Where-Object {
+            $tn = ([string]$_.$testNameCol).ToUpperInvariant()
+            foreach ($token in $tokens) {
+                if ($tn.Contains($token)) {
+                    return $true
+                }
+            }
+            return $false
+        }
+    )
+
+    Write-Host ("Filtered ILAS rows by include tokens {0}: {1} -> {2}" -f ($tokens -join ","), $before, $filtered.Count)
+    if ($filtered.Count -eq 0) {
+        throw "No ILAS rows remain after applying include-token filter: $($tokens -join ',')"
+    }
+
+    return $filtered
+}
+
 $runStart = Get-Date
 $tempRawFile = ""
 $pulledRawInThisRun = $false
@@ -591,44 +771,51 @@ try {
 
     $reference = Get-VisualLotReference -UpsvfCsvPath $UpsvfReferenceCsv
 
-    $visualIdArg = @()
-    if ($UseLotFilterOnlyQuery) {
-        Write-Host "ILAS query mode override: skipping VisualID query filter and using lot filter only."
+    $allVisualIds = @()
+    if (-not [string]::IsNullOrWhiteSpace($VisualIdsOverride)) {
+        $allVisualIds = @(
+            ($VisualIdsOverride -split '[,;\s]+' ) |
+                ForEach-Object { ([string]$_).Trim().ToUpperInvariant() } |
+                Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+        )
+        Write-Host ("Using VisualIdsOverride with {0} VisualID(s)." -f $allVisualIds.Count)
     }
     elseif ($reference -and $reference.VisualIds.Count -gt 0) {
         $allVisualIds = @($reference.VisualIds)
-        # Normalize all Visual IDs to uppercase for consistency with UPSVF matching
-        $normalizedIds = @()
-        foreach ($vid in $allVisualIds) {
-            $normalized = ([string]$vid).Trim().ToUpperInvariant()
-            if (-not [string]::IsNullOrWhiteSpace($normalized)) {
-                $normalizedIds += $normalized
-            }
-        }
-        if ($normalizedIds.Count -gt 0) {
-            $visualIdsCsv = ($normalizedIds -join ",")
-            # Native process invocation on Windows fails when the command line gets too long.
-            # If this happens, pull by lot only and apply exact VisualID+lot post-filtering.
-            if ($visualIdsCsv.Length -le 7000) {
-                $visualIdArg = @("-visualIds", $visualIdsCsv)
-                Write-Host ("Using {0} VisualID(s) from UPSVF reference for single ILAS pull." -f $normalizedIds.Count)
-            }
-            else {
-                Write-Host ("VisualID argument length ({0}) exceeds safe command-line size. Falling back to lot-only single pull with exact post-filtering to UPSVF keys." -f $visualIdsCsv.Length)
-            }
-        }
+        Write-Host ("Using all VisualIDs from UPSVF reference: {0} VisualID(s)." -f $allVisualIds.Count)
+    }
+
+    $visualIdChunks = @(Get-VisualIdChunksForAqua -VisualIds $allVisualIds -MaxPerChunk $MaxVisualIdsPerQuery -MaxArgumentLength $MaxVisualIdArgumentLength)
+    if ($visualIdChunks.Count -gt 0) {
+        Write-Host ("Prepared {0} VisualID chunk(s) for AQUA pull (no random sampling)." -f $visualIdChunks.Count)
     }
 
     $lotArgs = @("-lotsfromfs")
+    $lotChunks = @()
     if ($reference -and $reference.Lots.Count -gt 0 -and [string]::IsNullOrWhiteSpace($LotsOverride)) {
-        $lotArgs = @("-lots", ($reference.Lots -join ","))
-        Write-Host ("Using {0} lot(s) from UPSVF reference for ILAS pull." -f $reference.Lots.Count)
+        $lotChunks = @(Split-ValuesIntoChunks -Values $reference.Lots -MaxPerChunk $MaxLotsPerQuery)
+        if ($lotChunks.Count -gt 0) {
+            $lotArgs = @("-lots", (@($lotChunks[0]) -join ","))
+        }
+        Write-Host ("Using {0} lot(s) from UPSVF reference for ILAS pull in {1} chunk(s)." -f $reference.Lots.Count, [Math]::Max(1, $lotChunks.Count))
     }
     elseif (-not [string]::IsNullOrWhiteSpace($LotsOverride)) {
-        $lotArgs = @("-lots", $LotsOverride)
+        $overrideLots = @(
+            ($LotsOverride -split '[,;\s]+') |
+                ForEach-Object { ([string]$_).Trim().ToUpperInvariant() } |
+                Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+        )
+        $lotChunks = @(Split-ValuesIntoChunks -Values $overrideLots -MaxPerChunk $MaxLotsPerQuery)
+        if ($lotChunks.Count -gt 0) {
+            $lotArgs = @("-lots", (@($lotChunks[0]) -join ","))
+            Write-Host ("Using LotsOverride with {0} lot(s) in {1} chunk(s)." -f $overrideLots.Count, $lotChunks.Count)
+        }
+        else {
+            $lotArgs = @("-lots", $LotsOverride)
+        }
     }
 
-    $hasSpecificFilter = ($visualIdArg.Count -gt 0) -or ($lotArgs.Count -gt 1)
+    $hasSpecificFilter = ($visualIdChunks.Count -gt 0) -or ($lotArgs.Count -gt 1)
 
     if (-not [string]::IsNullOrWhiteSpace($RawInputFile)) {
         if (-not (Test-Path -LiteralPath $RawInputFile)) { throw "Provided RawInputFile does not exist: $RawInputFile" }
@@ -637,10 +824,11 @@ try {
     }
     else {
         if (-not (Test-Path -LiteralPath $AquaExe)) { throw "Aqua executable not found: $AquaExe" }
+        $AquaExe = Resolve-AquaExePathForAutomation -SourceAquaExePath $AquaExe
 
         Write-Host "Pulling ILAS VMIN_DTS from AQUA..."
         if ($hasSpecificFilter) {
-            if ($visualIdArg.Count -gt 0) {
+            if ($visualIdChunks.Count -gt 0) {
                 Write-Host "ILAS AQUA query filter mode: VisualID filter + lot filter."
             }
             else {
@@ -651,25 +839,93 @@ try {
             Write-Host ("ILAS AQUA query filter mode: LastNDaysTestEnd={0}" -f $LastNDaysTestEnd)
         }
 
-        Invoke-IlasAquaPull `
-            -AquaExePath $AquaExe `
-            -AquaServerValue $AquaServer `
-            -ReportPathValue $IlasReportPath `
-            -OutputFilePath $tempRawFile `
-            -ProgramPatternValue $ProgramPattern `
-            -OperationsValue $Operations `
-            -FunctionalBinValue $FunctionalBin `
-            -LotArgs $lotArgs `
-            -VisualIdArgs $visualIdArg `
-            -AquaMaxRowsValue $AquaMaxRows `
-            -LastNDaysTestEndValue $LastNDaysTestEnd `
-            -AllowLastNDays:($hasSpecificFilter -eq $false -and $LastNDaysTestEnd -gt 0) `
-            -TimeoutSeconds $AquaPullTimeoutSeconds `
-            -PollSeconds $AquaPullPollSeconds
+        $lotArgSets = @()
+        if ($lotChunks.Count -gt 0) {
+            foreach ($lotChunk in $lotChunks) {
+                $lotArgSets += ,@("-lots", (@($lotChunk) -join ","))
+            }
+        }
+        else {
+            $lotArgSets += ,$lotArgs
+        }
 
-        $sourceRawFile = $tempRawFile
-        $pulledRawInThisRun = $true
-        Write-Host "AQUA pull complete: $sourceRawFile"
+        $visualArgSets = @()
+        if ($visualIdChunks.Count -gt 0) {
+            foreach ($vc in $visualIdChunks) {
+                $visualArgSets += ,@("-visualIds", (@($vc) -join ","))
+            }
+        }
+        else {
+            $visualArgSets += ,@()
+        }
+
+        $requiresChunkedPull = ($visualArgSets.Count -gt 1) -or ($lotArgSets.Count -gt 1) -or ($visualIdChunks.Count -gt 0)
+
+        if ($requiresChunkedPull) {
+            $combinedRows = New-Object System.Collections.Generic.List[object]
+            $pullIndex = 0
+            $totalPulls = $visualArgSets.Count * $lotArgSets.Count
+            foreach ($visualArgsSet in $visualArgSets) {
+                foreach ($lotArgsSet in $lotArgSets) {
+                    $pullIndex++
+                    $vCount = 0
+                    if ($visualArgsSet.Count -gt 1) { $vCount = (([string]$visualArgsSet[1]) -split ',').Count }
+                    $lCount = 0
+                    if ($lotArgsSet.Count -gt 1) { $lCount = (([string]$lotArgsSet[1]) -split ',').Count }
+
+                    $chunkFile = Join-Path $OutputDirectory ("_ilas_raw_{0}_chunk{1:D3}.csv" -f $runStamp, $pullIndex)
+                    Write-Host ("Pulling ILAS chunk {0}/{1} (VisualIDs={2}, Lots={3})..." -f $pullIndex, $totalPulls, $vCount, $lCount)
+
+                    Invoke-IlasAquaPull `
+                        -AquaExePath $AquaExe `
+                        -AquaServerValue $AquaServer `
+                        -ReportPathValue $IlasReportPath `
+                        -OutputFilePath $chunkFile `
+                        -ProgramPatternValue $ProgramPattern `
+                        -OperationsValue $Operations `
+                        -FunctionalBinValue $FunctionalBin `
+                        -LotArgs $lotArgsSet `
+                        -VisualIdArgs $visualArgsSet `
+                        -AquaMaxRowsValue $AquaMaxRows `
+                        -LastNDaysTestEndValue $LastNDaysTestEnd `
+                        -AllowLastNDays:($false) `
+                        -TimeoutSeconds $AquaPullTimeoutSeconds `
+                        -PollSeconds $AquaPullPollSeconds
+
+                    $chunkRows = @(Import-Csv -LiteralPath $chunkFile)
+                    foreach ($row in $chunkRows) {
+                        $combinedRows.Add($row)
+                    }
+
+                    Remove-Item -LiteralPath $chunkFile -Force -ErrorAction SilentlyContinue
+                }
+            }
+
+            $rawRows = @($combinedRows)
+            $sourceRawFile = "AQUA multi-chunk pull"
+            Write-Host ("AQUA pull complete across chunks: {0} rows total." -f $rawRows.Count)
+        }
+        else {
+            Invoke-IlasAquaPull `
+                -AquaExePath $AquaExe `
+                -AquaServerValue $AquaServer `
+                -ReportPathValue $IlasReportPath `
+                -OutputFilePath $tempRawFile `
+                -ProgramPatternValue $ProgramPattern `
+                -OperationsValue $Operations `
+                -FunctionalBinValue $FunctionalBin `
+                -LotArgs $lotArgs `
+                -VisualIdArgs @() `
+                -AquaMaxRowsValue $AquaMaxRows `
+                -LastNDaysTestEndValue $LastNDaysTestEnd `
+                -AllowLastNDays:($hasSpecificFilter -eq $false -and $LastNDaysTestEnd -gt 0) `
+                -TimeoutSeconds $AquaPullTimeoutSeconds `
+                -PollSeconds $AquaPullPollSeconds
+
+            $sourceRawFile = $tempRawFile
+            $pulledRawInThisRun = $true
+            Write-Host "AQUA pull complete: $sourceRawFile"
+        }
     }
 
     if (-not $rawRows) {
@@ -693,6 +949,11 @@ try {
     $suffixUnits = Get-UniqueValueCount -Rows $rawRows -ColumnName "Visual ID"
     if ($suffixUnits -eq 0) { $suffixUnits = Get-UniqueValueCount -Rows $rawRows -ColumnName "VISUAL_ID" }
     Write-Host ("ILAS stage: after suffix filter rows={0}, unique units={1}" -f $rawRows.Count, $suffixUnits)
+
+    $rawRows = @(Filter-RowsByTestNameContainsTokens -Rows $rawRows -IncludeTokens ($TestNameIncludeTokens -split ','))
+    $tokenUnits = Get-UniqueValueCount -Rows $rawRows -ColumnName "Visual ID"
+    if ($tokenUnits -eq 0) { $tokenUnits = Get-UniqueValueCount -Rows $rawRows -ColumnName "VISUAL_ID" }
+    Write-Host ("ILAS stage: after SA-Atom token filter rows={0}, unique units={1}" -f $rawRows.Count, $tokenUnits)
 
     $allColumns = $rawRows[0].PSObject.Properties.Name
 
@@ -888,27 +1149,25 @@ try {
 
     $isoInfo = Get-IsoWeekYear -Date (Get-Date)
     $suffix = "WW{0:D2}_{1}" -f $isoInfo.Week, $isoInfo.Year
+    if (-not [string]::IsNullOrWhiteSpace($OutputTag)) {
+        $safeTag = ($OutputTag -replace '[^A-Za-z0-9]', '_')
+        if (-not [string]::IsNullOrWhiteSpace($safeTag)) {
+            $suffix = "{0}_{1}" -f $safeTag, $suffix
+        }
+    }
     if (-not [string]::IsNullOrWhiteSpace($LotsOverride)) {
         $safeLot = ($LotsOverride -replace '[^A-Za-z0-9]', '_')
-        # Truncate to 40 chars to prevent output paths exceeding the Windows MAX_PATH limit (260 chars).
-        if ($safeLot.Length -gt 40) { $safeLot = $safeLot.Substring(0, 40) }
         $suffix = "{0}_{1}" -f $safeLot, $suffix
     }
 
     $detailCsv = Join-Path $OutputDirectory ("ILAS_Vmin_Detail_{0}.csv" -f $suffix)
     $finalCsv = Join-Path $OutputDirectory ("ILAS_Vmin_Summary_{0}.csv" -f $suffix)
 
-    # Always materialize summary first so downstream merge can proceed even if detail export is too large/slow.
+    $allRecords | Export-Csv -LiteralPath $detailCsv -NoTypeInformation
     $finalRows | Export-Csv -LiteralPath $finalCsv -NoTypeInformation
-    Assert-NonEmptyFile -Path $finalCsv -Label "ILAS summary CSV"
 
-    try {
-        $allRecords | Export-Csv -LiteralPath $detailCsv -NoTypeInformation
-        Assert-NonEmptyFile -Path $detailCsv -Label "ILAS detail CSV"
-    }
-    catch {
-        Write-Warning "ILAS detail export failed; continuing with summary output. Details: $($_.Exception.Message)"
-    }
+    Assert-NonEmptyFile -Path $detailCsv -Label "ILAS detail CSV"
+    Assert-NonEmptyFile -Path $finalCsv -Label "ILAS summary CSV"
 
     Write-Host ""
     Write-Host ("Detail CSV  : {0}" -f $detailCsv)
