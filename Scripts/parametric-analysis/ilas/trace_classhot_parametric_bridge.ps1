@@ -20,7 +20,10 @@ param(
     [string]$OutputPrefix = "trace_classhot_bridge",
     [string]$LotFilter = "",
     [double]$MinValidVmin = 0.2,
-    [double]$MaxValidVmin = 2.0
+    [double]$MaxValidVmin = 2.0,
+    [bool]$RequireCcfData = $false,
+    [string[]]$RequiredCcfLots = @(),
+    [string[]]$RequiredCcfCorners = @('F1', 'F2', 'F3', 'F4', 'F7')
 )
 
 Set-StrictMode -Version Latest
@@ -78,7 +81,7 @@ function Get-VminDisplayDomainToken {
     )
 
     $cfgToken = if ([string]::IsNullOrWhiteSpace($CfgDomain)) { "" } else { $CfgDomain.Trim().ToUpperInvariant() }
-    if ($cfgToken -eq "CCF0") {
+    if ($cfgToken -match '^CCF\d*$') {
         return "CCF"
     }
     if (-not [string]::IsNullOrWhiteSpace($cfgToken)) {
@@ -352,9 +355,17 @@ function Infer-DomainHintFromTestName {
     if ($u -match "_CR(?:_|$)") { return "CR" }
     if ($u -match "_AT(?:_|$)|_ATOM(?:_|$)") { return "AT" }
     if ($u -match "_GT(?:_|$)|VCCGT|GTSICC") { return "GT" }
+    if ($u -match "CCF|VCCF") { return "CCF" }
     if ($u -match "VCCSA|_SA(?:_|$)|SAQ|SAC|SAN|SAPS|SAME|SAIOC|SADPU") { return "SA" }
 
     return ""
+}
+
+function Is-CcfDomain {
+    param([string]$Domain)
+
+    if ([string]::IsNullOrWhiteSpace($Domain)) { return $false }
+    return $Domain.Trim().ToUpperInvariant() -match '^CCF\d*$'
 }
 
 function Get-MaxDtsForRecord {
@@ -401,6 +412,7 @@ function Get-MaxDtsForRecord {
         if ($u.StartsWith("SA") -or $u.StartsWith("HUB")) { $hasHub = $true }
         if ($u.StartsWith("GT")) { $hasGt = $true }
         if ($u.StartsWith("CR") -or $u -eq "CORE") { $hasCore = $true }
+        if ($u.StartsWith("CCF")) { $hasCore = $true }
         if ($u.StartsWith("AT") -or $u -eq "ATOM") { $hasAtom = $true }
     }
 
@@ -533,6 +545,18 @@ function Get-GeometrySuffixFromTestName {
     if ($u -like '*FUS_UNITINFO_CXX*MAIN_FUSE_READ*') { return 'U1.U5' }
 
     return ""
+}
+
+function Get-UniqueUpper {
+    param([string[]]$Values)
+
+    $set = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($value in $Values) {
+        if (-not [string]::IsNullOrWhiteSpace($value)) {
+            [void]$set.Add($value.Trim().ToUpperInvariant())
+        }
+    }
+    return @($set | Sort-Object)
 }
 
 if (-not (Test-Path -LiteralPath $InputCsvPath)) {
@@ -764,7 +788,7 @@ Import-Csv -LiteralPath $InputCsvPath | ForEach-Object {
         if ($parsed.Count -eq 0) {
             $single = Parse-SiccEntryFromTestName -TestName $testName -RawValue $rawValue
             if ($null -ne $single) {
-                $parsed = @($single)
+                $parsed = ,$single
             }
         }
 
@@ -947,6 +971,9 @@ foreach ($s in $siccLookup.Values) {
     $siccByVisualLot[$k].Add($s)
 }
 
+$requiredCcfLotsNormalized = Get-UniqueUpper -Values $RequiredCcfLots
+$requiredCcfCornersNormalized = Get-UniqueUpper -Values $RequiredCcfCorners
+
 $finalRows = New-Object System.Collections.Generic.List[object]
 
 foreach ($vk in $visualLotSet) {
@@ -1056,20 +1083,111 @@ foreach ($vk in $visualLotSet) {
     $finalRows.Add([pscustomobject]$rowMap)
 }
 
+$ccfDiagnostics = New-Object System.Collections.Generic.List[object]
+foreach ($lot in $requiredCcfLotsNormalized) {
+    $lotRecords = @($bestVminByCombo.Values | Where-Object { $_.ClasshotLot -eq $lot -and (Is-CcfDomain -Domain ([string]$_.CfgDomain)) })
+    if ($lotRecords.Count -eq 0) {
+        $ccfDiagnostics.Add([pscustomobject]@{
+            ClasshotLot = $lot
+            Corner = ''
+            Status = 'missing-ccf-records'
+            Message = 'No CCF VMIN records found for required lot.'
+        })
+        Add-Violation -VisualID '' -ClasshotLot $lot -Message 'REQUIRED_CCF_MISSING:No CCF VMIN records found.'
+        continue
+    }
+
+    foreach ($corner in $requiredCcfCornersNormalized) {
+        $cornerRecords = @($lotRecords | Where-Object { ([string]$_.FreqCorner).Trim().ToUpperInvariant() -eq $corner })
+        if ($cornerRecords.Count -eq 0) {
+            $ccfDiagnostics.Add([pscustomobject]@{
+                ClasshotLot = $lot
+                Corner = $corner
+                Status = 'missing-corner'
+                Message = 'Required CCF corner is missing.'
+            })
+            Add-Violation -VisualID '' -ClasshotLot $lot -Message ("REQUIRED_CCF_CORNER_MISSING:{0}" -f $corner)
+            continue
+        }
+
+        $fieldComplete = $false
+        foreach ($rec in $cornerRecords) {
+            if (-not [string]::IsNullOrWhiteSpace([string]$rec.Vmin) -and
+                -not [string]::IsNullOrWhiteSpace([string]$rec.Setter) -and
+                -not [string]::IsNullOrWhiteSpace([string]$rec.MaxDTS_C) -and
+                -not [string]::IsNullOrWhiteSpace([string]$rec.LP)) {
+                $fieldComplete = $true
+                break
+            }
+        }
+
+        if ($fieldComplete) {
+            $ccfDiagnostics.Add([pscustomobject]@{
+                ClasshotLot = $lot
+                Corner = $corner
+                Status = 'ok'
+                Message = 'CCF corner has Vmin/Setter/MaxDTS_C/LP.'
+            })
+        }
+        else {
+            $ccfDiagnostics.Add([pscustomobject]@{
+                ClasshotLot = $lot
+                Corner = $corner
+                Status = 'missing-fields'
+                Message = 'CCF corner exists but one or more fields are empty: Vmin/Setter/MaxDTS_C/LP.'
+            })
+            Add-Violation -VisualID '' -ClasshotLot $lot -Message ("REQUIRED_CCF_FIELDS_MISSING:{0}" -f $corner)
+        }
+    }
+}
+
 $runStamp = Get-Date -Format "yyyyMMdd_HHmmss"
 $vminStagePath = Join-Path $OutputDirectory ("{0}_vmin_stage_{1}.csv" -f $OutputPrefix, $runStamp)
 $siccStagePath = Join-Path $OutputDirectory ("{0}_sicc_stage_{1}.csv" -f $OutputPrefix, $runStamp)
 $finalPath = Join-Path $OutputDirectory ("{0}_final_{1}.csv" -f $OutputPrefix, $runStamp)
+$violationsPath = Join-Path $OutputDirectory ("{0}_violations_{1}.csv" -f $OutputPrefix, $runStamp)
+$ccfDiagnosticsPath = Join-Path $OutputDirectory ("{0}_ccf_diagnostics_{1}.csv" -f $OutputPrefix, $runStamp)
 
-@($bestVminByCombo.Values) |
+$bestVminRows = foreach ($row in $bestVminByCombo.Values) { $row }
+$bestVminRows |
     Sort-Object VisualID, ClasshotLot, Domain, CoreIndex, FreqCorner, Flow, FreqGHz |
     Select-Object VisualID, ClasshotLot, Domain, FreqCorner, Flow, FreqGHz, CoreIndex, Vmin, VminLow, VminHigh, SearchPoints, Setter, MaxDTS_C, LP |
     Export-Csv -LiteralPath $vminStagePath -NoTypeInformation -Encoding UTF8
-@($siccLookup.Values) |
+$siccStageRows = foreach ($row in $siccLookup.Values) { $row }
+$siccStageRows |
     Sort-Object VisualID, ClasshotLot, Domain, CoreIndex, VoltagePoint |
     Select-Object VisualID, ClasshotLot, SourceTestName, Domain, CoreIndex, VoltagePoint, SiccValue, TemperatureValue |
     Export-Csv -LiteralPath $siccStagePath -NoTypeInformation -Encoding UTF8
 $finalRows | Export-Csv -LiteralPath $finalPath -NoTypeInformation -Encoding UTF8
+
+$violationRows = New-Object System.Collections.Generic.List[object]
+foreach ($violationKey in $violations.Keys) {
+    $vp = $violationKey -split '\|\|', 2
+    $vVisual = if ($vp.Count -ge 1) { $vp[0] } else { '' }
+    $vLot = if ($vp.Count -ge 2) { $vp[1] } else { '' }
+    foreach ($msg in $violations[$violationKey]) {
+        $violationRows.Add([pscustomobject]@{
+            VisualID = $vVisual
+            ClasshotLot = $vLot
+            Message = [string]$msg
+        })
+    }
+}
+
+$violationRows |
+    Sort-Object ClasshotLot, VisualID, Message |
+    Export-Csv -LiteralPath $violationsPath -NoTypeInformation -Encoding UTF8
+
+$ccfDiagnostics |
+    Sort-Object ClasshotLot, Corner, Status |
+    Export-Csv -LiteralPath $ccfDiagnosticsPath -NoTypeInformation -Encoding UTF8
+
+if ($RequireCcfData -and $requiredCcfLotsNormalized.Count -gt 0) {
+    $blocking = @($ccfDiagnostics | Where-Object { $_.Status -ne 'ok' })
+    if ($blocking.Count -gt 0) {
+        throw ("CCF required-data gate failed. See diagnostics CSV: {0}" -f $ccfDiagnosticsPath)
+    }
+}
 
 Write-Host "Trace Classhot bridge completed."
 Write-Host ("Input rows used : {0}" -f $inputRowsUsed)
@@ -1077,3 +1195,5 @@ Write-Host ("Final rows      : {0}" -f $finalRows.Count)
 Write-Host ("VMIN stage CSV  : {0}" -f $vminStagePath)
 Write-Host ("SICC stage CSV  : {0}" -f $siccStagePath)
 Write-Host ("Final CSV       : {0}" -f $finalPath)
+Write-Host ("Violations CSV  : {0}" -f $violationsPath)
+Write-Host ("CCF diag CSV    : {0}" -f $ccfDiagnosticsPath)

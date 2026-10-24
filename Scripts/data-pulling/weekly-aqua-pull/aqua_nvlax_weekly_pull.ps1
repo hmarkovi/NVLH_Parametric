@@ -28,8 +28,15 @@ CHANGES (2026-06-21):
   Fix: step-column detection now falls back to DevRevStep_CLASSHOT when RCS_PROCESSSTEP variants are absent
   Filter mode tracks which column was found: "EqClasshot" (old) vs "NotEmpty" (new DevRevStep_CLASSHOT)
 
+CHANGES (2026-09-26):
+- Added optional LastNDaysTestStart support for UPSVF AQUA pulls
+    Reason: daily NVLAX62A0H25 automation needs a Test Start lookback while preserving the existing ILAS VisualID-driven flow
+
 .PARAMETER LastNDaysTestEnd
 Default: 7 (filters AQUA pull to last 7 days of test end date)
+
+.PARAMETER LastNDaysTestStart
+Default: 0 (disabled). When greater than zero, UPSVF AQUA pull uses test start lookback and does not also send test end lookback.
 #>
 
 param(
@@ -38,8 +45,9 @@ param(
     [string]$ReportPath = "hmarkovi\BSAT_UPS2_POR_PTL_NVL WW12",
     [string]$ProgramPattern = "NVLAX6*",
     [string]$Operations = "6248",
-    [string]$OutputDirectory = "\\ger\ec\proj\ha\mmgbd\MMGBD_PSA\Products\NVL\NVLAZ Weekly",
+    [string]$OutputDirectory = "\\ger\ec\proj\ha\mmgbd\MMGBD_PSA\Products\NVL\NVL-AX\Weekly data pull",
     [int]$LastNDaysTestEnd = 7,
+    [int]$LastNDaysTestStart = 0,
     [int]$RetentionDays = 366,
     [int]$MaxVisualUnits = 100000,
     [int]$AquaMaxRows = 150000,
@@ -313,19 +321,29 @@ function Resolve-AquaExePathForAutomation {
         New-Item -Path $cacheDir -ItemType Directory -Force | Out-Null
     }
     
-    # Copy from UNC if not cached, or if source is newer
+    # Copy from UNC if not cached, or if source is newer and accessible.
+    # Scheduled S4U/background sessions may not be able to probe the UNC source,
+    # so prefer an existing cached copy when one is already available.
     $needsCopy = $false
     if (-not (Test-Path -LiteralPath $cachedExe)) {
         $needsCopy = $true
     } else {
-        $sourceInfo = Get-Item -LiteralPath $SourceAquaExePath
-        $cachedInfo = Get-Item -LiteralPath $cachedExe
-        if ($sourceInfo.LastWriteTime -gt $cachedInfo.LastWriteTime) {
-            $needsCopy = $true
+        try {
+            $sourceInfo = Get-Item -LiteralPath $SourceAquaExePath -ErrorAction Stop
+            $cachedInfo = Get-Item -LiteralPath $cachedExe -ErrorAction Stop
+            if ($sourceInfo.LastWriteTime -gt $cachedInfo.LastWriteTime) {
+                $needsCopy = $true
+            }
+        }
+        catch {
+            return $cachedExe
         }
     }
     
     if ($needsCopy) {
+        if (-not (Test-Path -LiteralPath $SourceAquaExePath)) {
+            throw "Aqua executable not found: $SourceAquaExePath"
+        }
         Copy-Item -LiteralPath $SourceAquaExePath -Destination $cachedExe -Force | Out-Null
         # Unblock the local copy to suppress security warnings
         Unblock-File -LiteralPath $cachedExe -ErrorAction SilentlyContinue
@@ -708,10 +726,6 @@ function Test-IsIlasDataUnavailableMessage {
 
 
 try {
-    if (-not (Test-Path -LiteralPath $AquaExe)) {
-        throw "Aqua executable not found: $AquaExe"
-    }
-
     if (-not (Test-Path -LiteralPath $OutputDirectory)) {
         New-Item -Path $OutputDirectory -ItemType Directory -Force | Out-Null
     }
@@ -746,13 +760,16 @@ try {
         Write-Host "Using Aqua executable: $AquaExe"
 
         # Build AQUA args array conditionally so callers can clear individual filters
-        # by passing empty string (ProgramPattern/Operations) or 0 (LastNDaysTestEnd).
+        # by passing empty string (ProgramPattern/Operations) or 0 (LastNDaysTestEnd/LastNDaysTestStart).
         $aquaCallArgs = [System.Collections.Generic.List[string]]::new()
         $aquaCallArgs.AddRange([string[]]@("-aquaserver", $AquaServer, "-reportpath", $ReportPath, "-outputfilename", $tempRawFile))
         if (-not [string]::IsNullOrWhiteSpace($ProgramPattern)) {
             $aquaCallArgs.AddRange([string[]]@("-programNames", $ProgramPattern))
         }
-        if ($LastNDaysTestEnd -gt 0) {
+        if ($LastNDaysTestStart -gt 0) {
+            $aquaCallArgs.AddRange([string[]]@("-lastNDaysTestStart", [string]$LastNDaysTestStart))
+        }
+        elseif ($LastNDaysTestEnd -gt 0) {
             $aquaCallArgs.AddRange([string[]]@("-lastNDaysTestEnd", [string]$LastNDaysTestEnd))
         }
         if (-not [string]::IsNullOrWhiteSpace($Operations)) {
@@ -765,12 +782,30 @@ try {
 
         $activeFilters = @()
         if (-not [string]::IsNullOrWhiteSpace($ProgramPattern)) { $activeFilters += "ProgramNames=$ProgramPattern" }
-        if ($LastNDaysTestEnd -gt 0)                             { $activeFilters += "LastNDaysTestEnd=$LastNDaysTestEnd" }
+    if ($LastNDaysTestStart -gt 0)                           { $activeFilters += "LastNDaysTestStart=$LastNDaysTestStart" }
+    elseif ($LastNDaysTestEnd -gt 0)                         { $activeFilters += "LastNDaysTestEnd=$LastNDaysTestEnd" }
         if (-not [string]::IsNullOrWhiteSpace($Operations))      { $activeFilters += "Operations=$Operations" }
         if ($lotArgs.Count -gt 0) { $activeFilters += "LotArgs=$($lotArgs -join ' ')" }
         Write-Host "AQUA filters active: $($activeFilters -join ' | ')"
 
-        & $AquaExe @aquaCallArgs
+        $aquaTimestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+        $aquaStdOutPath = Join-Path $env:TEMP ("aqua_nvlax_stdout_" + $aquaTimestamp + ".log")
+        $aquaStdErrPath = Join-Path $env:TEMP ("aqua_nvlax_stderr_" + $aquaTimestamp + ".log")
+
+        $aquaOutput = & $AquaExe @aquaCallArgs 2>&1
+        $aquaLogText = if ($null -ne $aquaOutput) { [string]::Join([Environment]::NewLine, @($aquaOutput)) } else { '' }
+        if (-not [string]::IsNullOrWhiteSpace($aquaLogText)) {
+            Set-Content -LiteralPath $aquaStdOutPath -Value $aquaLogText -Encoding UTF8 -Force
+        }
+        else {
+            Set-Content -LiteralPath $aquaStdOutPath -Value '' -Encoding UTF8 -Force
+        }
+        Set-Content -LiteralPath $aquaStdErrPath -Value '' -Encoding UTF8 -Force
+
+        if ($LASTEXITCODE -ne 0) {
+            $stderrText = $aquaLogText
+            throw "AQUA query failed with exit code $LASTEXITCODE. Output: $stderrText"
+        }
 
         Write-Host "Waiting for AQUA output file to be created and stabilized..."
         $isReady = Wait-ForFileReady -Path $tempRawFile -TimeoutSeconds $AquaPullTimeoutSeconds -PollSeconds $AquaPullPollSeconds
@@ -869,6 +904,7 @@ try {
     $safeProgram = Get-SafeFileNamePart -Value $mostAbundantProgram
 
     $now = Get-Date
+    $isoWeekInfo = Get-IsoWeekYear -Date $now
     $dateStamp = $now.ToString("yyyyMMdd")
     $csvName = "Vmin_{0}.csv" -f $dateStamp
     $csvPath = Join-Path $OutputDirectory $csvName
@@ -980,7 +1016,7 @@ try {
 
     $statusEntry = [pscustomobject]@{
         RunTimestamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss zzz")
-        IsoWeek = ("WW{0:D2}-{1}" -f $isoWeek, $year)
+        IsoWeek = ("WW{0:D2}-{1}" -f $isoWeekInfo.Week, $isoWeekInfo.Year)
         ProgramFilter = $ProgramPattern
         MostAbundantProgram = $mostAbundantProgram
         RowsBeforeClean = $rows.Count
@@ -990,7 +1026,7 @@ try {
         VisualUnitsCap = $MaxVisualUnits
         CleanCsvPath = $cleanCsvPath
         FinalOutputCsvPath = $(if ($ilasStatus -eq "SUCCESS" -or $ilasStatus -eq "WAITING_FOR_DATA" -or $SkipIlasStep) { $csvPath } else { "" })
-        Filters = ("exclude lot suffix MV; keep RCS_PROCESSSTEP=Classhot; limit to {0} visual units" -f $MaxVisualUnits)
+        Filters = ("exclude lot suffix MV; keep {0} ({1}); date filter {2}; limit to {3} visual units" -f $stepColumn, $stepFilterMode, $(if ($LastNDaysTestStart -gt 0) { "LastNDaysTestStart=$LastNDaysTestStart" } elseif ($LastNDaysTestEnd -gt 0) { "LastNDaysTestEnd=$LastNDaysTestEnd" } else { "none" }), $MaxVisualUnits)
         RetentionDays = $RetentionDays
         IlasStatus = $ilasStatus
         IlasMessage = $ilasMessage

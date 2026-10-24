@@ -25,7 +25,7 @@ param(
     [string]$OpergroupFilter = "6248_CLASSHOT",
     [string]$ProgramPattern = "NVLAX6*",
     [string]$Operations = "6248",
-    [string]$OutputDirectory = "\\ger\ec\proj\ha\mmgbd\MMGBD_PSA\Products\NVL\NVLAZ Weekly",
+    [string]$OutputDirectory = "\\ger\ec\proj\ha\mmgbd\MMGBD_PSA\Products\NVL\NVL-AX\Weekly data pull",
     [int]$LastNDaysTestEnd = 7,
     [int]$AquaMaxRows = 0,
     [int]$AquaPullTimeoutSeconds = 3600,
@@ -116,6 +116,48 @@ function Get-VisualLotReference {
         UpsvfVisualColumn = $vidCol
         UpsvfLotColumn = $lotCol
     }
+}
+
+function Resolve-AquaExePathForAutomation {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$SourceAquaExePath
+    )
+
+    $cacheDir = Join-Path $env:LOCALAPPDATA "NVLAX\AquaCmdLine"
+    $cachedExe = Join-Path $cacheDir "AquaCmdLine.exe"
+
+    if (-not (Test-Path -LiteralPath $cacheDir)) {
+        New-Item -Path $cacheDir -ItemType Directory -Force | Out-Null
+    }
+
+    $needsCopy = $false
+    if (-not (Test-Path -LiteralPath $cachedExe)) {
+        $needsCopy = $true
+    }
+    else {
+        try {
+            $sourceInfo = Get-Item -LiteralPath $SourceAquaExePath -ErrorAction Stop
+            $cachedInfo = Get-Item -LiteralPath $cachedExe -ErrorAction Stop
+            if ($sourceInfo.LastWriteTime -gt $cachedInfo.LastWriteTime) {
+                $needsCopy = $true
+            }
+        }
+        catch {
+            return $cachedExe
+        }
+    }
+
+    if ($needsCopy) {
+        if (-not (Test-Path -LiteralPath $SourceAquaExePath)) {
+            throw "Aqua executable not found: $SourceAquaExePath"
+        }
+
+        Copy-Item -LiteralPath $SourceAquaExePath -Destination $cachedExe -Force | Out-Null
+        Unblock-File -LiteralPath $cachedExe -ErrorAction SilentlyContinue
+    }
+
+    return $cachedExe
 }
 
 function Get-UniqueValueCount {
@@ -632,6 +674,7 @@ try {
         $sourceRawFile = $RawInputFile
     }
     else {
+        $AquaExe = Resolve-AquaExePathForAutomation -SourceAquaExePath $AquaExe
         if (-not (Test-Path -LiteralPath $AquaExe)) { throw "Aqua executable not found: $AquaExe" }
 
         Write-Host "Pulling ILAS VMIN_DTS from AQUA..."
